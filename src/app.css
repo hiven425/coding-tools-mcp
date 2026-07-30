@@ -194,11 +194,42 @@ button {
   background: rgba(0, 0, 0, 0.12);
 }
 
-.tx-app-version {
+.tx-app-meta {
   margin: 10px 6px 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.tx-app-version {
+  margin: 0;
   color: #7a88aa;
   font-size: 11px;
   letter-spacing: 0.04em;
+}
+
+.tx-repo-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: #9aa8c7;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: color var(--duration-fast) var(--ease-out),
+    background var(--duration-fast) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out);
+}
+
+.tx-repo-link:hover {
+  color: #d7def0;
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.08);
 }
 
 .tx-main {

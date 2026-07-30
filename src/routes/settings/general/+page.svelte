@@ -1,11 +1,16 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { message } from "@tauri-apps/plugin-dialog";
+  import { ask, message } from "@tauri-apps/plugin-dialog";
+  import { ExternalLink, RefreshCw } from "@lucide/svelte";
   import { getProxy, setProxy, type ProxyConfigDto } from "$lib/api/settings";
+  import { checkAppUpdate, openUrl } from "$lib/api/app-info";
+  import { APP_VERSION } from "$lib/app-version";
+  import { RELEASES_LATEST_URL, REPO_URL } from "$lib/app-links";
 
   let proxy = $state<ProxyConfigDto>({ mode: "none", url: "" });
   let changed = $state(false);
   let saving = $state(false);
+  let checkingUpdate = $state(false);
 
   async function refresh() {
     try {
@@ -33,6 +38,40 @@
     changed = true;
   }
 
+  async function openLink(url: string, title: string) {
+    try {
+      await openUrl(url);
+    } catch (e) {
+      await message(String(e), { title, kind: "error" });
+    }
+  }
+
+  async function handleCheckUpdate() {
+    if (checkingUpdate) return;
+    checkingUpdate = true;
+    try {
+      const result = await checkAppUpdate();
+      if (result.updateAvailable) {
+        const openRelease = await ask(
+          `发现新版本 ${result.latestTag}（当前 v${result.currentVersion}）。是否打开 Releases 页面下载？`,
+          { title: "有可用更新", kind: "info", okLabel: "打开下载页", cancelLabel: "稍后" },
+        );
+        if (openRelease) {
+          await openUrl(result.releaseUrl || RELEASES_LATEST_URL);
+        }
+      } else {
+        await message(`当前已是最新版本（v${result.currentVersion}）。`, {
+          title: "检查更新",
+          kind: "info",
+        });
+      }
+    } catch (e) {
+      await message(String(e), { title: "检查更新失败", kind: "error" });
+    } finally {
+      checkingUpdate = false;
+    }
+  }
+
   onMount(refresh);
 </script>
 
@@ -41,11 +80,45 @@
     <p class="page-kicker">全局设置</p>
     <h2 class="page-title">通用</h2>
     <p class="mt-2 max-w-2xl text-sm text-[var(--color-text-muted)]">
-      配置全局网络代理。此代理将应用于 Cloudflare 隧道连接，不影响软件下载代理。
+      配置全局网络代理，并查看应用版本与官方仓库入口。
     </p>
   </header>
 
   <div class="page-body flex flex-col gap-6">
+    <div class="tx-card p-4">
+      <h3 class="text-sm font-semibold">关于</h3>
+      <p class="mt-1 text-xs text-[var(--color-text-muted)]">
+        当前版本 v{APP_VERSION}。仓库与新版本安装包都在 GitHub Releases。
+      </p>
+      <div class="mt-4 flex flex-wrap gap-2">
+        <button
+          type="button"
+          class="inline-flex items-center gap-1.5 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-3 py-1.5 text-sm"
+          onclick={() => void openLink(REPO_URL, "无法打开仓库")}
+        >
+          <ExternalLink size={14} strokeWidth={2} />
+          打开仓库
+        </button>
+        <button
+          type="button"
+          class="inline-flex items-center gap-1.5 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-3 py-1.5 text-sm"
+          onclick={() => void openLink(RELEASES_LATEST_URL, "无法打开 Releases")}
+        >
+          <ExternalLink size={14} strokeWidth={2} />
+          打开 Releases
+        </button>
+        <button
+          type="button"
+          class="inline-flex items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+          disabled={checkingUpdate}
+          onclick={() => void handleCheckUpdate()}
+        >
+          <RefreshCw size={14} strokeWidth={2} class={checkingUpdate ? "animate-spin" : ""} />
+          {checkingUpdate ? "检查中…" : "检查更新"}
+        </button>
+      </div>
+    </div>
+
     <div class="tx-card p-4">
       <h3 class="text-sm font-semibold">网络代理</h3>
       <form

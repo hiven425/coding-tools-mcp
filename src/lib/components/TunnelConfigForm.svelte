@@ -97,7 +97,19 @@
     if (tokenField && (showLegacyFrpToken || showCloudflareToken)) {
       await tokenField.saveIfDirty();
     }
-    await onSave({ ...draft }, options);
+    const payload: TunnelFormConfig = {
+      ...draft,
+      frp_server_port: normalizePort(draft.frp_server_port, 7000),
+    };
+    await onSave(payload, options);
+  }
+
+  function normalizePort(value: number | string | null | undefined, fallback: number): number {
+    const parsed = typeof value === "number" ? value : Number(value);
+    if (!Number.isFinite(parsed) || parsed < 1 || parsed > 65535) {
+      throw new Error(`端口无效：请填写 1-65535 之间的整数（当前：${String(value)}）`);
+    }
+    return Math.trunc(parsed);
   }
 
   async function save() {

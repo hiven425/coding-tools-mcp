@@ -63,10 +63,12 @@ impl RuntimeSupervisor {
         self.start(profile, ServiceKind::Actions)
     }
 
+    #[allow(dead_code)] // Kept for sync callers (tests / teardown helpers).
     pub fn restart_mcp(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
         self.restart(profile, ServiceKind::Mcp)
     }
 
+    #[allow(dead_code)] // Kept for sync callers (tests / teardown helpers).
     pub fn restart_actions(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
         self.restart(profile, ServiceKind::Actions)
     }
@@ -392,6 +394,7 @@ impl RuntimeSupervisor {
     /// be freed instantly (the old listener's socket is closed on the tokio
     /// event loop). We retry `start` with a short back-off to smooth over this
     /// window.
+    #[allow(dead_code)]
     fn restart(
         &mut self,
         profile: &WorkspaceProfile,

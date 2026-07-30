@@ -1,6 +1,10 @@
 <script lang="ts">
   import ThemeToggle from "$lib/components/ThemeToggle.svelte";
   import { APP_VERSION } from "$lib/app-version";
+  import { REPO_URL } from "$lib/app-links";
+  import { openUrl } from "$lib/api/app-info";
+  import { message } from "@tauri-apps/plugin-dialog";
+  import { Github } from "@lucide/svelte";
   import type { Snippet } from "svelte";
 
   interface Props {
@@ -11,6 +15,14 @@
   }
 
   let { children, sidebar, onAddWorkspace, settingsNav }: Props = $props();
+
+  async function openRepo() {
+    try {
+      await openUrl(REPO_URL);
+    } catch (e) {
+      await message(String(e), { title: "无法打开仓库", kind: "error" });
+    }
+  }
 </script>
 
 <div class="app-layout">
@@ -41,11 +53,23 @@
       <div class="tx-sidebar-footer">
         <p class="tx-sidebar-section-label">设置</p>
         {@render settingsNav()}
-        <p class="tx-app-version">v{APP_VERSION}</p>
+        <div class="tx-app-meta">
+          <p class="tx-app-version">v{APP_VERSION}</p>
+          <button type="button" class="tx-repo-link" onclick={() => void openRepo()}>
+            <Github size={12} strokeWidth={2} />
+            <span>仓库</span>
+          </button>
+        </div>
       </div>
     {:else}
       <div class="tx-sidebar-footer">
-        <p class="tx-app-version">v{APP_VERSION}</p>
+        <div class="tx-app-meta">
+          <p class="tx-app-version">v{APP_VERSION}</p>
+          <button type="button" class="tx-repo-link" onclick={() => void openRepo()}>
+            <Github size={12} strokeWidth={2} />
+            <span>仓库</span>
+          </button>
+        </div>
       </div>
     {/if}
   </aside>

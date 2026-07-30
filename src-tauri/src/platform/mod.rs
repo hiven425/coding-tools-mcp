@@ -48,7 +48,7 @@ mod windows;
 mod open;
 mod paths;
 
-pub use open::open_path_in_file_manager;
+pub use open::{is_allowed_url, open_path_in_file_manager, open_url};
 
 #[cfg(target_os = "linux")]
 pub use linux::LinuxPlatform;

@@ -1,12 +1,14 @@
+mod app_info;
 mod frp_profiles;
 mod health;
 mod logs;
-mod runtime;
+pub(crate) mod runtime;
 mod secrets;
 mod software;
 mod tunnel;
 mod workspace;
 
+pub use app_info::{check_app_update, open_url};
 pub use frp_profiles::{
     delete_frp_profile, get_app_settings, get_last_workspace_id, get_proxy, list_frp_profiles,
     save_frp_profile, set_last_workspace, set_proxy,

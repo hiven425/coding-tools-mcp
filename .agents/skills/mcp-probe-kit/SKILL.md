@@ -2,7 +2,7 @@
 name: mcp-probe-kit
 description: >-
   将用户意图路由到 mcp-probe-kit MCP 工具（start_feature、start_bugfix、code_insight、workflow、gencommit 等）。在已配置 MCP 且准备写代码前读取；仅说明调哪个 MCP，不是项目研发流程本身。Routes intent to mcp-probe-kit MCP tools; read before coding when MCP is configured.
-mcp-probe-kit-version: "3.6.11"
+mcp-probe-kit-version: "3.7.0"
 ---
 
 # MCP 调用时机 — mcp-probe-kit
@@ -138,5 +138,5 @@ mcp-probe-kit-version: "3.6.11"
 
 ---
 
-*mcp-probe-kit 按版本自动同步（当前 `3.6.11`）。路径：`.agents/skills/mcp-probe-kit/SKILL.md`*
+*mcp-probe-kit 按版本自动同步（当前 `3.7.0`）。路径：`.agents/skills/mcp-probe-kit/SKILL.md`*
 

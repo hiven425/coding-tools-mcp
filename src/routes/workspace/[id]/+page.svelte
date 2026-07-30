@@ -436,13 +436,17 @@
     await promptServiceRestart(actionsStatus === "running", "Actions 服务");
   }
 
-  async function saveMcpAuth(auth: AuthConfig) {
+  async function saveMcpAuth(auth: AuthConfig, options?: { skipRuntimeRestart?: boolean }) {
     if (!profile || !workspaceId) return;
     const next: WorkspaceProfile = { ...profile, auth };
     await updateWorkspace(next);
     profile = next;
-    if (mcpStatus === "running") {
-      try { await restartRuntime(workspaceId); } catch { /* ignore */ }
+    if (!options?.skipRuntimeRestart && mcpStatus === "running") {
+      try {
+        await restartRuntime(workspaceId);
+      } catch (error) {
+        showToast(String(error), { title: "服务重启失败", kind: "error", duration: 8000 });
+      }
     }
   }
 
@@ -462,7 +466,11 @@
     await updateWorkspace(next);
     profile = next;
     if (actionsStatus === "running") {
-      try { await restartActionsRuntime(workspaceId); } catch { /* ignore */ }
+      try {
+        await restartActionsRuntime(workspaceId);
+      } catch (error) {
+        showToast(String(error), { title: "服务重启失败", kind: "error", duration: 8000 });
+      }
     }
   }
 

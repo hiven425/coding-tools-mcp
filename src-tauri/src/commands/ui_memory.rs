@@ -103,7 +103,13 @@ pub async fn recreate_ui_webview(app: AppHandle) -> AppResult<()> {
     let outer_position = window.outer_position().ok();
     let outer_size = window.outer_size().ok();
     let is_maximized = window.is_maximized().unwrap_or(false);
-    let is_minimized = window.is_minimized().unwrap_or(false);
+    // Do NOT re-apply minimized after rebuild: recreating a minimized WebViewWindow
+    // on Windows often leaves a taskbar entry that cannot be restored/maximized
+    // (silent recreate while minimized made the UI unreachable).
+
+    // Unminimize first so destroy/rebuild happens from a normal window state.
+    let _ = window.unminimize();
+    let _ = window.show();
 
     // Keepalive window: ensures destroy(main) is not "close last window → exit".
     let keepalive = WebviewWindowBuilder::new(
@@ -158,12 +164,13 @@ pub async fn recreate_ui_webview(app: AppHandle) -> AppResult<()> {
     if let Some(size) = outer_size {
         let _ = new_window.set_size(tauri::Size::Physical(size));
     }
+
+    // Always bring the replacement window back as a normal, restorable window.
+    let _ = new_window.unminimize();
+    let _ = new_window.show();
     if is_maximized {
         let _ = new_window.maximize();
-    } else if is_minimized {
-        let _ = new_window.minimize();
     }
-    let _ = new_window.show();
     let _ = new_window.set_focus();
 
     // Remove keepalive only after main is back.

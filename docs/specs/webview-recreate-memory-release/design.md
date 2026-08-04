@@ -51,3 +51,4 @@ src/routes/settings/general/+page.svelte  # 手动释放文案可微调
 - destroy 后 build 失败会导致无窗口：提供 from_config 失败时的硬编码回退构建。
 - invoke 在窗口销毁时可能被前端判定为失败：属预期，以 Rust 侧成功为准。
 - **0.1.30 回归**：销毁唯一窗口会触发 Tauri 进程退出，MCP/FRP 一并消失。0.1.31 起必须同时：`UI_RECREATING` + `ExitRequested.prevent_exit`，以及先创建隐藏 keepalive 窗口再 destroy 主窗口。
+- **0.1.31 回归**：最小化触发静默重建后若再 `minimize()` 新窗口，Windows 上任务栏图标可能无法还原/最大化。0.1.32 起：destroy 前先 `unminimize`；重建后**禁止**再 minimize，只 `show`/`focus`，最大化状态可保留。

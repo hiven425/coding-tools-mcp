@@ -505,6 +505,16 @@
     if (!confirmed) return;
     await deleteWorkspace(workspaceId);
     workspaces.update((items) => items.filter((item) => item.id !== workspaceId));
+    mcpRuntimeStates.update((states) => {
+      const next = { ...states };
+      delete next[workspaceId];
+      return next;
+    });
+    actionsRuntimeStates.update((states) => {
+      const next = { ...states };
+      delete next[workspaceId];
+      return next;
+    });
     goto("/");
   }
 

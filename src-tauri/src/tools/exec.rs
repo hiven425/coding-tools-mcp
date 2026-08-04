@@ -7,8 +7,10 @@ use std::os::windows::process::CommandExt;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
+use std::sync::Arc;
+
 use crate::tools::context::ToolContext;
-use crate::tools::session::ExecSession;
+use crate::tools::session::{ExecSession, SessionStore};
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 
 pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -265,7 +267,7 @@ async fn run_command(
 
     if yield_time.is_zero() {
         let snapshot = session.snapshot(max_output);
-        spawn_timeout_monitor(session.clone(), deadline);
+        spawn_timeout_monitor(ctx.sessions.clone(), session.clone(), deadline);
         return Ok(merge_exec_result(snapshot, start, cmd, cwd, true));
     }
 
@@ -304,6 +306,8 @@ async fn run_command(
             session.refresh_status().await;
             session.wait_for_readers().await;
             let snapshot = session.snapshot(max_output);
+            // Snapshot is embedded; schedule eviction so abandoned timeouts do not linger.
+            schedule_session_eviction(ctx.sessions.clone(), session.session_id.clone());
             return Err(WorkspaceError::ToolDetails {
                 code: "TIMEOUT",
                 message: "Command timed out.".into(),
@@ -319,14 +323,21 @@ async fn run_command(
         }
         if Instant::now() - start >= yield_time || tty {
             let snapshot = session.snapshot(max_output);
-            spawn_timeout_monitor(session.clone(), deadline);
+            spawn_timeout_monitor(ctx.sessions.clone(), session.clone(), deadline);
             return Ok(merge_exec_result(snapshot, start, cmd, cwd, true));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
-fn spawn_timeout_monitor(session: std::sync::Arc<ExecSession>, deadline: Instant) {
+/// How long a timed-out / background session stays readable before map eviction.
+const SESSION_EVICT_AFTER_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn spawn_timeout_monitor(
+    sessions: Arc<SessionStore>,
+    session: Arc<ExecSession>,
+    deadline: Instant,
+) {
     tauri::async_runtime::spawn(async move {
         let remaining = deadline.saturating_duration_since(Instant::now());
         tokio::time::sleep(remaining).await;
@@ -337,6 +348,15 @@ fn spawn_timeout_monitor(session: std::sync::Arc<ExecSession>, deadline: Instant
             session.refresh_status().await;
             session.wait_for_readers().await;
         }
+        // Keep the session briefly so clients can still read_output / probe status.
+        schedule_session_eviction(sessions, session.session_id.clone());
+    });
+}
+
+fn schedule_session_eviction(sessions: Arc<SessionStore>, session_id: String) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(SESSION_EVICT_AFTER_TIMEOUT).await;
+        sessions.remove(&session_id);
     });
 }
 
@@ -661,6 +681,16 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_hidden_creation_flags_match_frpc_no_window_pattern() {
+        assert_eq!(
+            windows_hidden_creation_flags(),
+            0x0000_0200 | 0x0800_0000,
+            "must keep CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_scripts_use_their_platform_runners() {
         let batch = command_for_program("C:/workspace/run-anything.cmd", &[]);
         assert_eq!(batch.as_std().get_program().to_string_lossy(), "cmd.exe");
@@ -681,6 +711,15 @@ mod tests {
             .to_ascii_lowercase();
         assert!(runner.contains("powershell") || runner.contains("pwsh"));
         assert!(script.as_std().get_args().any(|arg| arg == "-File"));
+
+        // Ensure console-subsystem programs (python.exe) also go through the
+        // hidden-window flag path; Command does not expose creation_flags for
+        // direct assertion, so this only verifies construction still succeeds.
+        let python = command_for_program("C:/Python312/python.exe", &["-c".into(), "print(1)".into()]);
+        assert_eq!(
+            python.as_std().get_program().to_string_lossy(),
+            "C:/Python312/python.exe"
+        );
     }
 
     #[cfg(windows)]
@@ -809,6 +848,15 @@ mod tests {
     }
 }
 
+#[cfg(windows)]
+fn windows_hidden_creation_flags() -> u32 {
+    // Match frpc/cloudflared: hide console-subsystem children (python/cmd/powershell)
+    // so remote exec_command does not flash a console or steal focus.
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+}
+
 fn command_for_program(program: &str, args: &[String]) -> Command {
     #[cfg(windows)]
     {
@@ -823,6 +871,7 @@ fn command_for_program(program: &str, args: &[String]) -> Command {
                 command
                     .as_std_mut()
                     .raw_arg(windows_batch_command_line(program, args));
+                command.creation_flags(windows_hidden_creation_flags());
                 return command;
             }
             Some("ps1") => {
@@ -841,6 +890,7 @@ fn command_for_program(program: &str, args: &[String]) -> Command {
                         windows_command_path(program).as_str(),
                     ])
                     .args(args);
+                command.creation_flags(windows_hidden_creation_flags());
                 return command;
             }
             _ => {}
@@ -849,6 +899,8 @@ fn command_for_program(program: &str, args: &[String]) -> Command {
 
     let mut command = Command::new(program);
     command.args(args);
+    #[cfg(windows)]
+    command.creation_flags(windows_hidden_creation_flags());
     command
 }
 

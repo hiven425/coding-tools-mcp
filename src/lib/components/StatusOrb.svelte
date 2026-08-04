@@ -16,8 +16,12 @@
   };
 </script>
 
+<!--
+  Do not use infinite CSS animation (e.g. animate-pulse) for steady "running".
+  Long-lived WebView2 sessions showed HOST/renderer memory growing for hours;
+  continuous compositor animation is a cheap first A/B to rule out.
+-->
 <span
   class="inline-block h-2.5 w-2.5 rounded-full {colorClass[state]}"
-  class:animate-pulse={state === "running"}
   aria-label={state}
 ></span>

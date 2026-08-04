@@ -27,6 +27,19 @@
           <p class="tx-toast__title">{toast.title}</p>
         {/if}
         <p class="tx-toast__message">{toast.message}</p>
+        {#if toast.action}
+          <button
+            type="button"
+            class="tx-toast__action"
+            onclick={() => {
+              const action = toast.action;
+              dismissToast(toast.id);
+              action?.onClick();
+            }}
+          >
+            {toast.action.label}
+          </button>
+        {/if}
       </div>
       <button
         type="button"

@@ -22,11 +22,13 @@
 
   let loading = $state(true);
   let secrets = $state<Record<string, string>>({});
+  let secretsLoadSeq = 0;
 
   const actions = $derived(actionsConfig(profile));
   const auth = $derived(profile.auth);
 
   async function loadSecrets() {
+    const seq = ++secretsLoadSeq;
     loading = true;
     try {
       if (service === "mcp") {
@@ -37,22 +39,25 @@
             : await getSecret(workspaceId, key as Parameters<typeof getSecret>[1]);
           return value ?? "";
         };
+        let next: Record<string, string>;
         if (auth.type === "oauth") {
           const clientId = useShared
             ? ((await getSharedSecret("oauth_client_id")) ?? "")
             : auth.oauth_client_id;
-          secrets = {
+          next = {
             oauth_client_id: clientId,
             oauth_client_secret: await fetchSecret("oauth_client_secret", "oauth_client_secret"),
             oauth_password: await fetchSecret("oauth_password", "oauth_password"),
           };
         } else if (auth.type === "bearer") {
-          secrets = {
+          next = {
             bearer_token: await fetchSecret("bearer_token", "bearer_token"),
           };
         } else {
-          secrets = {};
+          next = {};
         }
+        if (seq !== secretsLoadSeq) return;
+        secrets = next;
       } else {
         const useShared = actions.use_shared_secrets ?? false;
         const fetchSecret = async (key: string, sharedKey: string) => {
@@ -61,21 +66,24 @@
             : await getSecret(workspaceId, key as Parameters<typeof getSecret>[1]);
           return value ?? "";
         };
+        let next: Record<string, string>;
         if (actions.auth_type === "api_key") {
-          secrets = { actions_api_key: await fetchSecret("actions_api_key", "actions_api_key") };
+          next = { actions_api_key: await fetchSecret("actions_api_key", "actions_api_key") };
         } else if (actions.auth_type === "oauth") {
-          secrets = {
+          next = {
             actions_oauth_client_secret: await fetchSecret(
               "actions_oauth_client_secret",
               "actions_oauth_client_secret",
             ),
           };
         } else {
-          secrets = {};
+          next = {};
         }
+        if (seq !== secretsLoadSeq) return;
+        secrets = next;
       }
     } finally {
-      loading = false;
+      if (seq === secretsLoadSeq) loading = false;
     }
   }
 
@@ -90,6 +98,9 @@
     actions.oauth_scopes;
     actions.use_shared_secrets;
     void loadSecrets();
+    return () => {
+      secretsLoadSeq += 1;
+    };
   });
 </script>
 

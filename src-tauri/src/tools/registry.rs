@@ -668,7 +668,14 @@ pub fn input_schema(name: &str) -> Value {
                 "case_sensitive": { "type": "boolean", "default": false },
                 "context_lines": { "type": "integer", "minimum": 0, "maximum": 20, "default": 0 },
                 "max_preview_bytes": { "type": "integer", "minimum": 64, "maximum": 4096, "default": 512 },
-                "max_results": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 }
+                "max_results": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 },
+                "max_file_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 67108864,
+                    "default": 2097152,
+                    "description": "Skip files larger than this many bytes (default 2MiB) to avoid memory spikes"
+                }
             },
             "required": ["query"],
             "additionalProperties": false

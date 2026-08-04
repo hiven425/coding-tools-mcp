@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onDestroy } from "svelte";
+
   interface Props {
     value: string;
     label?: string;
@@ -7,13 +9,20 @@
 
   let { value, label = "复制", onCopy }: Props = $props();
   let copied = $state(false);
+  let resetTimer: ReturnType<typeof setTimeout> | undefined;
+
+  onDestroy(() => {
+    if (resetTimer !== undefined) clearTimeout(resetTimer);
+  });
 
   async function copy() {
     await navigator.clipboard.writeText(value);
     copied = true;
     onCopy?.();
-    setTimeout(() => {
+    if (resetTimer !== undefined) clearTimeout(resetTimer);
+    resetTimer = setTimeout(() => {
       copied = false;
+      resetTimer = undefined;
     }, 1500);
   }
 </script>

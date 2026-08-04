@@ -1,9 +1,10 @@
 <!-- mcp-probe:context begin — auto-generated; re-run init_project_context updates this block only -->
-<!-- mcp-probe:context-version: 3.7.0 -->
+<!-- mcp-probe:context-version: 4.0.0-rc.8 -->
 ## MCP（必须先调）
 需已配置 mcp-probe-kit。写代码前先读 Skill：@.agents/skills/mcp-probe-kit/SKILL.md（或 [MCP 调用时机](.agents/skills/mcp-probe-kit/SKILL.md)）（首次 MCP 调用自动创建 Skill 文件）。
 
 - 不确定用哪个 MCP → `workflow`（返回 firstTool）
+- 当前会话看不到 MCP 工具 → 读取 Skill 的“执行通道与自动降级”，通过 `.mcp-probe-kit/bin/probe.*` 调用同版本 CLI；不要要求用户安装
 - 新功能 → `start_feature`（会先搜记忆）
 - Bug → `start_bugfix`（会先搜记忆）
 - UI → `start_ui`（会先搜记忆）
@@ -18,8 +19,8 @@
 - 沉淀：跨仓库共享**勿填** source_project/source_path；路径写进 content；summary 写检索关键词
 - 修正：已有资产可用 `update_memory_asset` 按 asset_id 原地更新（保留 ID）
 - 清理：过时/错误/重复沉淀可用 `delete_memory_asset`（删除前建议 `read_memory_asset` 确认）
-- Bug 修完验证通过 → **必须** `memorize_asset` type=`bugfix` tags=`bugfix,root-cause`（content 含【现象】【根因】【修复】【验证】）
-- 功能/UI 可复用产出 → `memorize_asset` type=`pattern`/`component`
+- Bug 每轮验证后先准备成功/失败/证伪/回归候选并写入 `plan_heartbeat`；`converge` 通过后再 `memorize_asset`
+- 功能/UI 验证后先准备候选并写入 `plan_heartbeat`；`converge` 通过后再 `memorize_asset` type=`pattern`/`component`
 <!-- mcp-probe:context end -->
 
 <!-- gitnexus:start -->

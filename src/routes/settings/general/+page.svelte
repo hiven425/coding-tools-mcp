@@ -6,11 +6,16 @@
   import { checkAppUpdate, openUrl } from "$lib/api/app-info";
   import { APP_VERSION } from "$lib/app-version";
   import { RELEASES_LATEST_URL, REPO_URL } from "$lib/app-links";
+  import { getWebviewMemorySample } from "$lib/api/ui-memory";
+  import { reloadUiOnly } from "$lib/ui-memory-guard";
+  import { showToast } from "$lib/stores/toast";
 
   let proxy = $state<ProxyConfigDto>({ mode: "none", url: "" });
   let changed = $state(false);
   let saving = $state(false);
   let checkingUpdate = $state(false);
+  let releasingUi = $state(false);
+  let memoryHint = $state<string | null>(null);
 
   async function refresh() {
     try {
@@ -72,7 +77,35 @@
     }
   }
 
-  onMount(refresh);
+  async function refreshMemoryHint() {
+    try {
+      const sample = await getWebviewMemorySample();
+      if (!sample.supported) {
+        memoryHint = "当前平台暂不支持界面内存采样。";
+        return;
+      }
+      memoryHint = `界面约 ${Math.round(sample.webviewMb)} MB（${sample.webviewProcessCount} 个 WebView 进程），主进程约 ${Math.round(sample.mainMb)} MB。`;
+    } catch {
+      memoryHint = null;
+    }
+  }
+
+  async function handleReleaseUiMemory() {
+    if (releasingUi) return;
+    const ok = await ask(
+      "将重建界面进程（WebView）以释放内存。MCP、Actions 与 FRP 隧道会继续在后台运行，不会被停止。",
+      { title: "释放界面内存", kind: "info", okLabel: "立即释放", cancelLabel: "取消" },
+    );
+    if (!ok) return;
+    releasingUi = true;
+    showToast("正在重建界面进程…", { title: "释放界面内存", kind: "info", duration: 2000 });
+    await reloadUiOnly("settings-manual");
+  }
+
+  onMount(() => {
+    void refresh();
+    void refreshMemoryHint();
+  });
 </script>
 
 <section class="page-scroll">
@@ -115,6 +148,34 @@
         >
           <RefreshCw size={14} strokeWidth={2} class={checkingUpdate ? "animate-spin" : ""} />
           {checkingUpdate ? "检查中…" : "检查更新"}
+        </button>
+      </div>
+    </div>
+
+    <div class="tx-card p-4">
+      <h3 class="text-sm font-semibold">界面内存</h3>
+      <p class="mt-1 text-xs text-[var(--color-text-muted)]">
+        长时间运行后 WebView 可能占用较高内存。释放会重建界面进程，不会停止 MCP 或隧道。
+      </p>
+      {#if memoryHint}
+        <p class="mt-2 text-xs text-[var(--color-text-muted)]">{memoryHint}</p>
+      {/if}
+      <div class="mt-4 flex flex-wrap gap-2">
+        <button
+          type="button"
+          class="inline-flex items-center gap-1.5 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-3 py-1.5 text-sm"
+          onclick={() => void refreshMemoryHint()}
+        >
+          刷新占用
+        </button>
+        <button
+          type="button"
+          class="inline-flex items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+          disabled={releasingUi}
+          onclick={() => void handleReleaseUiMemory()}
+        >
+          <RefreshCw size={14} strokeWidth={2} class={releasingUi ? "animate-spin" : ""} />
+          {releasingUi ? "刷新中…" : "释放界面内存"}
         </button>
       </div>
     </div>

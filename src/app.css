@@ -732,6 +732,25 @@ button {
   word-break: break-word;
 }
 
+.tx-toast__action {
+  margin-top: 8px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--color-bg);
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-main);
+  cursor: pointer;
+}
+
+.tx-toast__action:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
 .tx-toast__close {
   flex-shrink: 0;
   display: flex;

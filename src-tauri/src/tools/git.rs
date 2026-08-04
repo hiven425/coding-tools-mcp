@@ -473,6 +473,13 @@ struct GitOutput {
 fn run_git(cwd: &std::path::Path, args: &[&str], limit: Duration) -> Result<GitOutput, WorkspaceError> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(cwd).args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
     let output = cmd
         .output()
         .map_err(|e| git_error(&format!("git not available: {e}")))?;

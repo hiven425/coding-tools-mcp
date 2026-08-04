@@ -21,6 +21,7 @@
   let draft = $state("");
   let saved = $state(false);
   let loading = $state(true);
+  let loadSeq = 0;
 
   const placeholder = $derived(saved && !draft ? "已保存（点击更新）" : "粘贴 Tunnel Token");
 
@@ -32,15 +33,21 @@
     workspaceId;
     secretKey;
     void load();
+    return () => {
+      loadSeq += 1;
+    };
   });
 
   async function load() {
+    const seq = ++loadSeq;
     loading = true;
     try {
       draft = "";
-      saved = await secretIsSet(workspaceId, secretKey);
+      const isSet = await secretIsSet(workspaceId, secretKey);
+      if (seq !== loadSeq) return;
+      saved = isSet;
     } finally {
-      loading = false;
+      if (seq === loadSeq) loading = false;
     }
   }
 

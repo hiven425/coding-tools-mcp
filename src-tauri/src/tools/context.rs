@@ -15,7 +15,7 @@ pub struct ToolContext {
     pub permission_mode: String,
     pub harness: Harness,
     default_cwd: Mutex<PathBuf>,
-    pub sessions: SessionStore,
+    pub sessions: Arc<SessionStore>,
 }
 
 pub type SharedToolContext = Arc<ToolContext>;
@@ -71,7 +71,7 @@ impl ToolContext {
             permission_mode,
             harness: Harness::new(root.clone(), harness_root).expect("无法初始化 Harness"),
             default_cwd: Mutex::new(root),
-            sessions: SessionStore::new(),
+            sessions: Arc::new(SessionStore::new()),
         }
     }
 

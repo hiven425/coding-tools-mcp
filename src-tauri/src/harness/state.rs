@@ -544,12 +544,16 @@ fn should_skip(path: &Path, root: &Path) -> bool {
 }
 
 fn git_value(root: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(root).args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+    let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }

@@ -16,6 +16,11 @@
     "skillCanonical": ".agents/skills/mcp-probe-kit/SKILL.md",
     "adapters": [
       {
+        "id": "cursor-rules",
+        "kind": "rules-pointer",
+        "path": ".cursor/rules/mcp-probe-kit.mdc"
+      },
+      {
         "id": "claude-pointer",
         "kind": "claude-pointer",
         "path": "CLAUDE.md"

@@ -56,6 +56,31 @@ async fn check_url(client: &reqwest::Client, url: &str) -> (bool, String) {
     }
 }
 
+async fn check_mcp_public_url(client: &reqwest::Client, url: &str) -> (bool, String) {
+    if url.is_empty() {
+        return (false, "URL not configured".to_string());
+    }
+    match client.get(url).send().await {
+        Ok(response) => {
+            let code = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            let lower = body.to_ascii_lowercase();
+            if (lower.contains("powered by") && lower.contains("frp"))
+                || (lower.contains("the page you requested was not found")
+                    && lower.contains("frp"))
+            {
+                return (
+                    false,
+                    format!("HTTP {code}; FRP 未挂载代理（返回 frp 404 页）"),
+                );
+            }
+            let ok = matches!(code, 200 | 401 | 405);
+            (ok, format!("HTTP {code}"))
+        }
+        Err(err) => (false, err.to_string()),
+    }
+}
+
 async fn check_json_field(client: &reqwest::Client, url: &str, field: &str) -> (bool, String) {
     if url.is_empty() {
         return (false, "URL not configured".to_string());
@@ -103,7 +128,8 @@ pub async fn run_health_checks(profile: &WorkspaceProfile) -> Vec<HealthItem> {
     };
 
     let (mcp_local_ok, mcp_local_detail) = check_url(&client, &profile.local_endpoint()).await;
-    let (mcp_public_ok, mcp_public_detail) = check_url(&client, &profile.public_endpoint()).await;
+    let (mcp_public_ok, mcp_public_detail) =
+        check_mcp_public_url(&client, &profile.public_endpoint()).await;
     let (mcp_oauth_ok, mcp_oauth_detail) = check_json_field(
         &client,
         &well_known_url(&mcp_public, ".well-known/oauth-authorization-server"),

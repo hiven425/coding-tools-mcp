@@ -528,9 +528,14 @@ impl TunnelSupervisor {
         };
 
         if let Some(child) = session.child.take() {
-            let _ = cloudflare::stop_child(child, session.pid).await;
+            cloudflare::stop_child(child, session.pid).await?;
         } else if let Some(pid) = session.pid {
-            let _ = platform().terminate_process_tree(pid);
+            platform().terminate_process_tree(pid)?;
+            if platform().is_process_alive(pid) {
+                return Err(AppError::Message(format!(
+                    "隧道进程 {pid} 在停止后仍然存活"
+                )));
+            }
         }
         Ok(())
     }

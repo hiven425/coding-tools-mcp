@@ -13,6 +13,7 @@ use crate::settings::ProxyConfig;
 use super::logs::sanitize_log_line;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
+const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Handle to a supervised `cloudflared` child process.
 pub struct CloudflareTunnelHandle {
@@ -515,13 +516,59 @@ async fn stream_cloudflare_output<R, E>(
 }
 
 pub async fn stop_child(mut child: Child, pid: Option<u32>) -> AppResult<()> {
-    if let Some(pid) = pid {
-        let _ = platform().terminate_process_tree(pid);
+    if child
+        .try_wait()
+        .map_err(|error| AppError::Message(format!("检查隧道进程状态失败: {error}")))?
+        .is_some()
+    {
+        return Ok(());
     }
 
-    let _ = child.kill().await;
-    let _ = time::timeout(Duration::from_secs(3), child.wait()).await;
-    Ok(())
+    let tracked_pid = pid.or_else(|| child.id());
+    let terminate_error = tracked_pid.and_then(|pid| {
+        platform()
+            .terminate_process_tree(pid)
+            .err()
+            .map(|error| error.to_string())
+    });
+
+    match time::timeout(STOP_TIMEOUT, child.wait()).await {
+        Ok(Ok(_)) => return Ok(()),
+        Ok(Err(error)) => return Err(AppError::Message(format!("等待隧道进程退出失败: {error}"))),
+        Err(_) => {}
+    }
+
+    let force_error = child.start_kill().err().map(|error| error.to_string());
+    match time::timeout(STOP_TIMEOUT, child.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(AppError::Message(format!(
+            "强制停止隧道进程后等待失败: {error}"
+        ))),
+        Err(_) => {
+            let still_alive = tracked_pid
+                .map(|pid| platform().is_process_alive(pid))
+                .unwrap_or(true);
+            let mut details = Vec::new();
+            if let Some(error) = terminate_error {
+                details.push(format!("终止进程树失败: {error}"));
+            }
+            if let Some(error) = force_error {
+                details.push(format!("强制停止失败: {error}"));
+            }
+            if still_alive {
+                details.push("进程仍存活".into());
+            }
+            Err(AppError::Message(format!(
+                "隧道进程未能在 {} 秒内退出{}",
+                STOP_TIMEOUT.as_secs() * 2,
+                if details.is_empty() {
+                    String::new()
+                } else {
+                    format!("：{}", details.join("；"))
+                }
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -529,10 +576,11 @@ mod tests {
     use std::path::Path;
 
     use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
     use tokio::sync::oneshot;
 
     use super::{
-        cloudflared_args, extract_trycloudflare_url, named_tunnel_ready_line,
+        cloudflared_args, extract_trycloudflare_url, named_tunnel_ready_line, stop_child,
         stream_cloudflare_output, QuickTunnelReady,
     };
     use crate::error::AppResult;
@@ -643,5 +691,29 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("无法打开 cloudflared 日志文件"));
+    }
+
+    #[tokio::test]
+    async fn stop_child_reaps_the_managed_process() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/D", "/S", "/C", "ping -n 30 127.0.0.1 > NUL"]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 30"]);
+            command
+        };
+
+        let child = command.spawn().expect("spawn managed child");
+        let pid = child.id().expect("managed child pid");
+        assert!(crate::platform::platform().is_process_alive(pid));
+
+        stop_child(child, Some(pid)).await.expect("stop child");
+
+        assert!(!crate::platform::platform().is_process_alive(pid));
     }
 }

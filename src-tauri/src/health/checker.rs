@@ -4,10 +4,11 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::settings::{AppSettings, ProxyConfig};
 use crate::tunnel::{append_profile_log, new_trace_id};
 use crate::workspace::WorkspaceProfile;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const MCP_PROBE_BUDGET: Duration = Duration::from_secs(10);
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -37,11 +38,35 @@ struct ProbeResult {
     detail: String,
 }
 
+#[cfg(test)]
 fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
+    http_client_with_proxy(&ProxyConfig {
+        mode: "none".into(),
+        url: String::new(),
+    })
+    .expect("failed to build direct HTTP client")
+}
+
+fn http_client_with_proxy(proxy: &ProxyConfig) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder().timeout(REQUEST_TIMEOUT);
+    match proxy.mode.trim() {
+        "" | "system" => {}
+        "none" => builder = builder.no_proxy(),
+        "manual" => {
+            let url = proxy.url.trim();
+            if url.is_empty() {
+                return Err("手动代理模式缺少代理地址".into());
+            }
+            let configured = reqwest::Proxy::all(url)
+                .map_err(|error| format!("代理地址无效: {error}"))?
+                .no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1"));
+            builder = builder.proxy(configured);
+        }
+        mode => return Err(format!("不支持的代理模式: {mode}")),
+    }
+    builder
         .build()
-        .expect("failed to build HTTP client")
+        .map_err(|error| format!("创建健康检查 HTTP 客户端失败: {error}"))
 }
 
 async fn probe_mcp_endpoint(
@@ -306,7 +331,30 @@ pub async fn run_health_checks(
         "health.log",
         &format!("[trace={trace_id}] stage=health-start"),
     );
-    let client = http_client();
+    let settings = AppSettings::load_or_default();
+    let client = match http_client_with_proxy(&settings.proxy) {
+        Ok(client) => client,
+        Err(error) => {
+            let items = vec![health_item(
+                "mcp.config",
+                "config",
+                "MCP 配置",
+                "fail",
+                error,
+                "检查设置 → 通用 → 网络代理。",
+                &trace_id,
+            )];
+            append_profile_log(
+                &profile.id,
+                "health.log",
+                &format!(
+                    "[trace={trace_id}] stage=health-complete status=public-degraded elapsed_ms={}",
+                    started_at.elapsed().as_millis()
+                ),
+            );
+            return items;
+        }
+    };
     let local_mcp = profile.local_endpoint();
     let public_base = profile.effective_public_url();
     let public_mcp = profile.public_endpoint();
@@ -717,6 +765,58 @@ mod tests {
 
         assert!(result.ok, "{}", result.detail);
         assert!(result.detail.contains("legacy GET returned HTTP 200"));
+    }
+
+    #[tokio::test]
+    async fn health_client_uses_manual_proxy() {
+        let proxy_app = Router::new().fallback(|| async { reqwest::StatusCode::OK });
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind fake proxy");
+        let proxy_address = listener.local_addr().expect("fake proxy address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, proxy_app).await;
+        });
+        let proxy = crate::settings::ProxyConfig {
+            mode: "manual".into(),
+            url: format!("http://{proxy_address}"),
+        };
+
+        let client = http_client_with_proxy(&proxy).expect("manual proxy client");
+        let result =
+            probe_legacy_endpoint(&client, "http://health-probe.invalid/mcp", ProbeAuth::None)
+                .await;
+        handle.abort();
+
+        assert!(result.ok, "{}", result.detail);
+    }
+
+    #[tokio::test]
+    async fn health_client_allows_response_beyond_legacy_three_second_limit() {
+        let app = Router::new().route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(3_200)).await;
+                reqwest::StatusCode::OK
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind slow health server");
+        let address = listener.local_addr().expect("slow health address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let result = probe_legacy_endpoint(
+            &http_client(),
+            &format!("http://{address}/slow"),
+            ProbeAuth::None,
+        )
+        .await;
+        handle.abort();
+
+        assert!(result.ok, "{}", result.detail);
     }
 
     #[test]

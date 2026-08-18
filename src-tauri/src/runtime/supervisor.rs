@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tauri::async_runtime::JoinHandle;
 
 use crate::actions;
+use crate::activity::ActivityStore;
 use crate::error::AppResult;
 use crate::mcp;
 use crate::platform::platform;
@@ -57,22 +59,30 @@ impl RuntimeSupervisor {
         self.status(profile, ServiceKind::Actions)
     }
 
-    pub fn start_mcp(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
-        self.start(profile, ServiceKind::Mcp)
+    pub fn start_mcp(
+        &mut self,
+        profile: &WorkspaceProfile,
+        activity: Arc<ActivityStore>,
+    ) -> AppResult<RuntimeStatusDto> {
+        self.start(profile, ServiceKind::Mcp, Some(activity))
     }
 
     pub fn start_actions(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
-        self.start(profile, ServiceKind::Actions)
+        self.start(profile, ServiceKind::Actions, None)
     }
 
     #[allow(dead_code)] // Kept for sync callers (tests / teardown helpers).
-    pub fn restart_mcp(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
-        self.restart(profile, ServiceKind::Mcp)
+    pub fn restart_mcp(
+        &mut self,
+        profile: &WorkspaceProfile,
+        activity: Arc<ActivityStore>,
+    ) -> AppResult<RuntimeStatusDto> {
+        self.restart(profile, ServiceKind::Mcp, Some(activity))
     }
 
     #[allow(dead_code)] // Kept for sync callers (tests / teardown helpers).
     pub fn restart_actions(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
-        self.restart(profile, ServiceKind::Actions)
+        self.restart(profile, ServiceKind::Actions, None)
     }
 
     /// True when the service for this workspace is currently running.
@@ -242,8 +252,10 @@ impl RuntimeSupervisor {
         &mut self,
         profile: &WorkspaceProfile,
         kind: ServiceKind,
+        activity: Option<Arc<ActivityStore>>,
     ) -> AppResult<RuntimeStatusDto> {
         let key = (profile.id.clone(), kind);
+        self.reap_finished_entry(&key, profile);
         if matches!(
             self.entries.get(&key).map(|e| &e.phase),
             Some(RuntimePhase::Running) | Some(RuntimePhase::Starting)
@@ -324,6 +336,7 @@ impl RuntimeSupervisor {
                     port,
                     PathBuf::from(&profile.path),
                     profile.id.clone(),
+                    profile.name.clone(),
                     auth,
                     profile.effective_public_url(),
                     oauth_client_secret,
@@ -331,6 +344,7 @@ impl RuntimeSupervisor {
                     oauth_token_secret,
                     profile.runtime.clone(),
                     transport_v2,
+                    activity.expect("MCP runtime requires activity store"),
                 )
             }
             ServiceKind::Actions => {
@@ -467,9 +481,10 @@ impl RuntimeSupervisor {
         &mut self,
         profile: &WorkspaceProfile,
         kind: ServiceKind,
+        activity: Option<Arc<ActivityStore>>,
     ) -> AppResult<RuntimeStatusDto> {
         self.sync_stop_and_wait(profile, kind);
-        self.start(profile, kind)
+        self.start(profile, kind, activity)
     }
 
     fn sync_stop_and_wait(&mut self, profile: &WorkspaceProfile, kind: ServiceKind) {
@@ -493,6 +508,33 @@ impl RuntimeSupervisor {
         let port = port_for(profile, kind);
         let mut should_cleanup_tunnel = false;
         if let Some(entry) = self.entries.get_mut(&key) {
+            if entry.phase == RuntimePhase::Running {
+                if entry
+                    .handle
+                    .as_ref()
+                    .is_some_and(|handle| handle.inner().is_finished())
+                {
+                    if let Some(handle) = entry.handle.take() {
+                        tauri::async_runtime::spawn(async move {
+                            let _ = handle.await;
+                        });
+                    }
+                    entry.shutdown.take();
+                    let message =
+                        format!("{}任务已意外结束，请重新启动", service_label(kind).trim());
+                    entry.phase = RuntimePhase::Error;
+                    entry.error_message = Some(message.clone());
+                    entry.public_state = "public-degraded".into();
+                    entry.public_error = Some(message.clone());
+                    entry.started_at = None;
+                    should_cleanup_tunnel = true;
+                    append_profile_log(
+                        &profile.id,
+                        stderr_log_name(kind),
+                        &format!("[refresh] {message}"),
+                    );
+                }
+            }
             if entry.phase == RuntimePhase::Running {
                 let listening = match platform().find_pid_listening_on_port(port) {
                     Ok(pid) => pid.is_some(),
@@ -565,6 +607,36 @@ impl RuntimeSupervisor {
                 );
             }
         });
+    }
+
+    fn reap_finished_entry(
+        &mut self,
+        key: &(String, ServiceKind),
+        profile: &WorkspaceProfile,
+    ) -> bool {
+        let finished = self
+            .entries
+            .get(key)
+            .and_then(|entry| entry.handle.as_ref())
+            .is_some_and(|handle| handle.inner().is_finished());
+        if !finished {
+            return false;
+        }
+
+        if let Some(mut entry) = self.entries.remove(key) {
+            entry.shutdown.take();
+            if let Some(handle) = entry.handle.take() {
+                tauri::async_runtime::spawn(async move {
+                    let _ = handle.await;
+                });
+            }
+        }
+        append_profile_log(
+            &profile.id,
+            stderr_log_name(key.1),
+            "[start] 已回收上一次意外结束的 runtime task",
+        );
+        true
     }
 }
 
@@ -703,6 +775,23 @@ mod tests {
     }
 
     #[test]
+    fn start_cleanup_removes_a_finished_runtime_handle() {
+        let mut supervisor = RuntimeSupervisor::default();
+        let profile = WorkspaceProfile::new(".".into(), Some("finished-runtime".into()));
+        let key = (profile.id.clone(), ServiceKind::Mcp);
+        let handle = tauri::async_runtime::spawn(async {});
+        while !handle.inner().is_finished() {
+            std::thread::yield_now();
+        }
+        let mut stale = entry(RuntimePhase::Running, Some(std::time::Instant::now()));
+        stale.handle = Some(handle);
+        supervisor.entries.insert(key.clone(), stale);
+
+        assert!(supervisor.reap_finished_entry(&key, &profile));
+        assert!(!supervisor.entries.contains_key(&key));
+    }
+
+    #[test]
     fn public_failure_does_not_mark_a_running_listener_as_failed() {
         let profile = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
         let key = (profile.id.clone(), ServiceKind::Mcp);
@@ -722,7 +811,10 @@ mod tests {
         let status = supervisor.mcp_status(&profile);
         assert_eq!(status.state, "running");
         assert_eq!(status.public_state, "public-error");
-        assert_eq!(status.public_error.as_deref(), Some("edge registration failed"));
+        assert_eq!(
+            status.public_error.as_deref(),
+            Some("edge registration failed")
+        );
     }
 
     #[test]

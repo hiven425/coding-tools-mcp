@@ -140,10 +140,11 @@ async fn runtime_status_with_tunnel(
         })
     })?;
     let settings = state.with_settings(|store| Ok(store.settings()))?;
-    let tunnel_status = crate::tunnel::supervisor()
-        .lock()
-        .await
-        .status(profile, tunnel_kind, &settings);
+    let tunnel_status =
+        crate::tunnel::supervisor()
+            .lock()
+            .await
+            .status(profile, tunnel_kind, &settings);
 
     if tunnel_status.provider_state != "public-stopped"
         || (status.public_error.is_none() && status.public_state != "not-configured")
@@ -173,7 +174,8 @@ async fn start_mcp_service(state: &AppState, id: &str) -> AppResult<RuntimeStatu
     validate_start_resources(state, id, WorkspaceService::Mcp)?;
     let profile = profile_by_id(state, id)?;
     ensure_port_available(profile.runtime.local_port, "本地 MCP").await?;
-    state.with_runtime(|runtime| runtime.start_mcp(&profile))?;
+    let activity = state.activity.clone();
+    state.with_runtime(|runtime| runtime.start_mcp(&profile, activity))?;
     sync_tunnel_routes_from_runtime(state).await?;
 
     match maybe_start_for_runtime(&profile, TunnelServiceKind::Mcp).await {
@@ -198,12 +200,7 @@ async fn start_mcp_service(state: &AppState, id: &str) -> AppResult<RuntimeStatu
                 &format!("[auto-start] MCP 公网隧道启动失败：{message}"),
             );
             state.with_runtime(|runtime| {
-                runtime.set_public_status(
-                    id,
-                    ServiceKind::Mcp,
-                    "public-error",
-                    Some(message),
-                );
+                runtime.set_public_status(id, ServiceKind::Mcp, "public-error", Some(message));
                 Ok(())
             })?;
         }
@@ -257,12 +254,7 @@ async fn start_actions_service(state: &AppState, id: &str) -> AppResult<RuntimeS
                 &format!("[auto-start] Actions 公网隧道启动失败：{message}"),
             );
             state.with_runtime(|runtime| {
-                runtime.set_public_status(
-                    id,
-                    ServiceKind::Actions,
-                    "public-error",
-                    Some(message),
-                );
+                runtime.set_public_status(id, ServiceKind::Actions, "public-error", Some(message));
                 Ok(())
             })?;
         }
@@ -280,14 +272,9 @@ async fn start_actions_service(state: &AppState, id: &str) -> AppResult<RuntimeS
 }
 
 /// Async stop→start for MCP. Used by the Tauri command and secret-change hooks.
-pub(crate) async fn restart_mcp_by_id(
-    state: &AppState,
-    id: &str,
-) -> AppResult<RuntimeStatusDto> {
+pub(crate) async fn restart_mcp_by_id(state: &AppState, id: &str) -> AppResult<RuntimeStatusDto> {
     let _guard = RESTART_GATE.lock().await;
-    let was_running = state.with_runtime(|runtime| {
-        Ok(runtime.is_running(id, ServiceKind::Mcp))
-    })?;
+    let was_running = state.with_runtime(|runtime| Ok(runtime.is_running(id, ServiceKind::Mcp)))?;
     if was_running {
         let profile = profile_by_id(state, id)?;
         let tunnel_stop = if profile.tunnel.tunnel_type == "cloudflare"
@@ -309,9 +296,8 @@ pub(crate) async fn restart_actions_by_id(
     id: &str,
 ) -> AppResult<RuntimeStatusDto> {
     let _guard = RESTART_GATE.lock().await;
-    let was_running = state.with_runtime(|runtime| {
-        Ok(runtime.is_running(id, ServiceKind::Actions))
-    })?;
+    let was_running =
+        state.with_runtime(|runtime| Ok(runtime.is_running(id, ServiceKind::Actions)))?;
     if was_running {
         let _ = stop_actions_service(state, id).await?;
     }

@@ -67,11 +67,7 @@ pub fn spawn_listener(
 
     let configured_public_url = public_base_url.trim().to_string();
     let oauth = if auth_type == "oauth" {
-        let oauth_base = external_base_url(
-            &HeaderMap::new(),
-            actions_port,
-            &configured_public_url,
-        );
+        let oauth_base = external_base_url(&HeaderMap::new(), actions_port, &configured_public_url);
         Some(Arc::new(OAuthRuntime::new(
             oauth_base,
             oauth_client_id,
@@ -88,20 +84,25 @@ pub fn spawn_listener(
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let profile_id = workspace_id.to_string();
     let handle = tauri::async_runtime::spawn(async move {
-        let result = serve(
-            listener,
-            actions_port,
-            &profile_id,
-            workspace_path,
-            configured_public_url,
-            auth_type,
-            api_key,
-            oauth,
-            oauth_client_secret,
-            policy,
-            shutdown_rx,
-        )
-        .await;
+        let result = match tokio::net::TcpListener::from_std(listener) {
+            Ok(listener) => {
+                serve(
+                    listener,
+                    actions_port,
+                    &profile_id,
+                    workspace_path,
+                    configured_public_url,
+                    auth_type,
+                    api_key,
+                    oauth,
+                    oauth_client_secret,
+                    policy,
+                    shutdown_rx,
+                )
+                .await
+            }
+            Err(error) => Err(format!("Actions 本地监听器初始化失败: {error}").into()),
+        };
         if let Err(err) = &result {
             append_profile_log(
                 &profile_id,
@@ -194,7 +195,10 @@ async fn serve(
             "/.well-known/oauth-authorization-server",
             get(oauth_authorization_server_metadata),
         )
-        .route("/oauth/authorize", get(oauth_authorize_get).post(oauth_authorize_post))
+        .route(
+            "/oauth/authorize",
+            get(oauth_authorize_get).post(oauth_authorize_post),
+        )
         .route("/oauth/token", post(oauth_token_post))
         .merge(protected)
         .with_state(state)
@@ -215,15 +219,14 @@ async fn serve(
     Ok(())
 }
 
-fn bind_listener(port: u16) -> Result<tokio::net::TcpListener, String> {
+fn bind_listener(port: u16) -> Result<std::net::TcpListener, String> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = std::net::TcpListener::bind(addr)
         .map_err(|err| format!("Actions 本地端口 {port} 绑定失败: {err}"))?;
     listener
         .set_nonblocking(true)
         .map_err(|err| format!("Actions 本地端口 {port} 设置非阻塞失败: {err}"))?;
-    tokio::net::TcpListener::from_std(listener)
-        .map_err(|err| format!("Actions 本地监听器初始化失败: {err}"))
+    Ok(listener)
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
@@ -319,12 +322,7 @@ async fn oauth_token_post(
         )
             .into_response();
     };
-    token_exchange(
-        oauth,
-        &headers,
-        form,
-        &resolve_oauth_base(&state, &headers),
-    )
+    token_exchange(oauth, &headers, form, &resolve_oauth_base(&state, &headers))
 }
 
 fn oauth_not_configured() -> Response {

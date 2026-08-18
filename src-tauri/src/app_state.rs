@@ -1,5 +1,6 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use crate::activity::ActivityStore;
 use crate::data::DataStore;
 use crate::error::AppResult;
 use crate::runtime::RuntimeSupervisor;
@@ -7,6 +8,7 @@ use crate::runtime::RuntimeSupervisor;
 pub struct AppState {
     pub data: Mutex<DataStore>,
     pub runtime: Mutex<RuntimeSupervisor>,
+    pub activity: Arc<ActivityStore>,
 }
 
 impl AppState {
@@ -16,6 +18,7 @@ impl AppState {
         Ok(Self {
             data: Mutex::new(store),
             runtime: Mutex::new(RuntimeSupervisor::default()),
+            activity: Arc::new(ActivityStore::new()),
         })
     }
 
@@ -27,7 +30,10 @@ impl AppState {
         f(&mut guard)
     }
 
-    pub fn with_workspaces<R>(&self, f: impl FnOnce(&mut DataStore) -> AppResult<R>) -> AppResult<R> {
+    pub fn with_workspaces<R>(
+        &self,
+        f: impl FnOnce(&mut DataStore) -> AppResult<R>,
+    ) -> AppResult<R> {
         self.with_data(f)
     }
 
@@ -35,7 +41,10 @@ impl AppState {
         self.with_data(f)
     }
 
-    pub fn with_runtime<R>(&self, f: impl FnOnce(&mut RuntimeSupervisor) -> AppResult<R>) -> AppResult<R> {
+    pub fn with_runtime<R>(
+        &self,
+        f: impl FnOnce(&mut RuntimeSupervisor) -> AppResult<R>,
+    ) -> AppResult<R> {
         let mut guard = self
             .runtime
             .lock()

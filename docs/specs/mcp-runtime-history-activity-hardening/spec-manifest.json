@@ -1,0 +1,21 @@
+{
+  "layout": "parent-child",
+  "subspecs": [
+    {
+      "id": "runtime-lifecycle",
+      "title": "Runtime 优雅启停与异常回收",
+      "fr": ["FR-1", "FR-6"]
+    },
+    {
+      "id": "history-v3",
+      "title": "History v3 状态投影与完整性",
+      "fr": ["FR-2", "FR-3", "FR-6"]
+    },
+    {
+      "id": "activity-observability",
+      "title": "脱敏活动追踪与桌面监控",
+      "fr": ["FR-4", "FR-5", "FR-6"],
+      "dependsOn": ["runtime-lifecycle"]
+    }
+  ]
+}

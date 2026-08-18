@@ -2,11 +2,20 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryIndex {
     pub version: u32,
     pub latest_number: u64,
     pub sessions: BTreeMap<String, IndexEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MalformedHistoryBlock {
+    pub path: String,
+    pub section: String,
+    pub block_index: usize,
+    pub line: usize,
+    pub error: String,
 }
 
 impl Default for HistoryIndex {
@@ -19,7 +28,7 @@ impl Default for HistoryIndex {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexEntry {
     pub number: u64,
     pub path: String,
@@ -45,6 +54,7 @@ pub struct ScanReport {
     pub duplicate_session_keys: Vec<String>,
     pub invalid_files: Vec<String>,
     pub empty_files: Vec<String>,
+    pub malformed_blocks: Vec<MalformedHistoryBlock>,
 }
 
 impl ScanReport {
@@ -57,6 +67,10 @@ impl ScanReport {
             && self.duplicate_session_keys.is_empty()
             && self.invalid_files.is_empty()
             && self.empty_files.is_empty()
+    }
+
+    pub fn archive_integrity_valid(&self) -> bool {
+        self.sequence_valid() && self.malformed_blocks.is_empty()
     }
 
     pub fn total_bytes(&self) -> u64 {
@@ -132,7 +146,7 @@ pub struct MemoryManifest {
     pub entries: Vec<ManifestEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryReference {
     pub number: u64,
     pub path: String,
@@ -145,6 +159,10 @@ pub struct MemoryState {
     pub state_revision: u64,
     pub archive_revision: String,
     pub generated_at: String,
+    #[serde(default)]
+    pub projection_scope: String,
+    #[serde(default)]
+    pub state_revision_semantics: String,
     pub current_session: Option<MemoryReference>,
     #[serde(default)]
     pub current_focus: String,
@@ -153,7 +171,16 @@ pub struct MemoryState {
     #[serde(default)]
     pub open_items: Vec<String>,
     #[serde(default)]
+    pub open_items_source: Option<MemoryReference>,
+    #[serde(default)]
     pub references: Vec<MemoryReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedSnapshot {
+    pub version: u32,
+    pub archive_revision: String,
+    pub state_revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

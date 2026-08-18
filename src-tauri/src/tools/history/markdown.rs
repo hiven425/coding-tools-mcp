@@ -64,8 +64,14 @@ pub fn render_document(
 }
 
 pub fn parse_initial_input_records(content: &str) -> Vec<InitialInputRecord> {
-    section_body(content, INITIAL_INPUT_HEADING)
-        .map(parse_json_blocks)
+    parse_initial_input_records_with_diagnostics(content).records
+}
+
+pub fn parse_initial_input_records_with_diagnostics(
+    content: &str,
+) -> ParsedJsonBlocks<InitialInputRecord> {
+    section_body_with_line(content, INITIAL_INPUT_HEADING)
+        .map(|(body, base_line)| parse_json_blocks(body, base_line))
         .unwrap_or_default()
 }
 
@@ -94,8 +100,14 @@ pub fn append_initial_input_revision(content: &str, record: &InitialInputRecord)
 }
 
 pub fn parse_checkpoint_records(content: &str) -> Vec<CheckpointRecord> {
-    section_body(content, CHECKPOINT_HEADING)
-        .map(parse_json_blocks)
+    parse_checkpoint_records_with_diagnostics(content).records
+}
+
+pub fn parse_checkpoint_records_with_diagnostics(
+    content: &str,
+) -> ParsedJsonBlocks<CheckpointRecord> {
+    section_body_with_line(content, CHECKPOINT_HEADING)
+        .map(|(body, base_line)| parse_json_blocks(body, base_line))
         .unwrap_or_default()
 }
 
@@ -132,31 +144,96 @@ pub fn with_updated_at(content: &str, timestamp: &str) -> String {
     updated
 }
 
-fn section_body<'a>(content: &'a str, heading: &str) -> Option<&'a str> {
-    let start = content.find(heading)? + heading.len();
+fn section_body_with_line<'a>(content: &'a str, heading: &str) -> Option<(&'a str, usize)> {
+    let heading_start = content.find(heading)?;
+    let start = heading_start + heading.len();
     let tail = &content[start..];
     let end = tail.find("\n## ").unwrap_or(tail.len());
-    Some(tail[..end].trim())
+    let raw = &tail[..end];
+    let trimmed_start = raw.len() - raw.trim_start().len();
+    let body = raw.trim();
+    let body_start = start + trimmed_start;
+    let base_line = content[..body_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    Some((body, base_line))
 }
 
-fn parse_json_blocks<T>(content: &str) -> Vec<T>
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonBlockDiagnostic {
+    pub block_index: usize,
+    pub line: usize,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedJsonBlocks<T> {
+    pub records: Vec<T>,
+    pub diagnostics: Vec<JsonBlockDiagnostic>,
+}
+
+impl<T> Default for ParsedJsonBlocks<T> {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+fn parse_json_blocks<T>(content: &str, base_line: usize) -> ParsedJsonBlocks<T>
 where
     T: serde::de::DeserializeOwned,
 {
     let mut records = Vec::new();
+    let mut diagnostics = Vec::new();
     let mut remaining = content;
+    let mut consumed = 0usize;
+    let mut block_index = 0usize;
     while let Some(fence_start) = remaining.find("```json\n") {
+        block_index += 1;
         let json_start = fence_start + "```json\n".len();
         let Some(fence_end) = remaining[json_start..].find("\n```") else {
+            let absolute_fence = consumed + fence_start;
+            let line = base_line
+                + content[..absolute_fence]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count();
+            diagnostics.push(JsonBlockDiagnostic {
+                block_index,
+                line,
+                error: "unterminated JSON fence".into(),
+            });
             break;
         };
         let json_text = &remaining[json_start..json_start + fence_end];
-        if let Ok(record) = serde_json::from_str::<T>(json_text) {
-            records.push(record);
+        match serde_json::from_str::<T>(json_text) {
+            Ok(record) => records.push(record),
+            Err(error) => {
+                let absolute_fence = consumed + fence_start;
+                let line = base_line
+                    + content[..absolute_fence]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count();
+                diagnostics.push(JsonBlockDiagnostic {
+                    block_index,
+                    line,
+                    error: error.to_string(),
+                });
+            }
         }
-        remaining = &remaining[json_start + fence_end + "\n```".len()..];
+        let advance = json_start + fence_end + "\n```".len();
+        consumed += advance;
+        remaining = &remaining[advance..];
     }
-    records
+    ParsedJsonBlocks {
+        records,
+        diagnostics,
+    }
 }
 
 fn json_block<T: serde::Serialize>(heading: &str, value: &T) -> String {

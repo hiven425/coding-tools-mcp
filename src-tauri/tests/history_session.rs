@@ -68,6 +68,10 @@ fn bootstrap_prefers_host_session_and_preserves_initial_input() {
         .path()
         .join("docs/history-session/memory/manifest.json")
         .is_file());
+    assert!(workspace
+        .path()
+        .join("docs/history-session/memory/snapshot.json")
+        .is_file());
 }
 
 #[test]
@@ -130,6 +134,8 @@ fn checkpoint_preserves_raw_input_and_superseding_revision_evidence() {
     });
     let first = invoke_ok(&ctx, "history_session_checkpoint", args.clone());
     assert_eq!(first["user_input_captured"], true);
+    assert_eq!(first["fidelity"], "full");
+    assert_eq!(first["persistence_complete"], true);
     assert_eq!(first["revision"], 1);
     assert!(!first["warnings"].as_array().expect("warnings").is_empty());
 
@@ -172,11 +178,98 @@ fn checkpoint_reports_missing_raw_user_input() {
         }),
     );
     assert_eq!(checkpoint["user_input_captured"], false);
+    assert_eq!(checkpoint["fidelity"], "partial");
+    assert_eq!(checkpoint["persistence_complete"], false);
     assert!(checkpoint["warnings"]
         .as_array()
         .expect("warnings")
         .iter()
         .any(|warning| warning.as_str().unwrap_or("").contains("raw_user_input")));
+}
+
+#[test]
+fn derived_state_open_items_are_latest_checkpoint_snapshot() {
+    let (_workspace, _harness, ctx) = test_context();
+    let boot = invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "open-item-snapshot", "initial_user_input": "开始发布"}),
+    );
+    invoke_ok(
+        &ctx,
+        "history_session_checkpoint",
+        json!({
+            "session_key": boot["session_key"],
+            "expected_path": boot["current_path"],
+            "turn_id": "release-pending",
+            "raw_user_input": "准备发布",
+            "remaining_issues": ["尚未创建 v* tag"],
+            "next_actions": ["发布 v0.1.34"]
+        }),
+    );
+    invoke_ok(
+        &ctx,
+        "history_session_checkpoint",
+        json!({
+            "session_key": boot["session_key"],
+            "expected_path": boot["current_path"],
+            "turn_id": "release-complete",
+            "raw_user_input": "发布已经完成",
+            "findings": ["v0.1.34 Release 已成功发布"],
+            "remaining_issues": [],
+            "next_actions": []
+        }),
+    );
+
+    let resumed = invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "open-item-snapshot"}),
+    );
+    assert_eq!(resumed["state"]["version"], 3);
+    assert_eq!(
+        resumed["state"]["projection_scope"],
+        "current_session_latest_checkpoint"
+    );
+    assert_eq!(resumed["state"]["open_items"], json!([]));
+    assert_eq!(
+        resumed["state"]["open_items_source"]["number"],
+        resumed["current_number"]
+    );
+}
+
+#[test]
+fn derived_state_does_not_merge_open_items_from_older_sessions() {
+    let (_workspace, _harness, ctx) = test_context();
+    let old = invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "old-session", "initial_user_input": "旧任务"}),
+    );
+    invoke_ok(
+        &ctx,
+        "history_session_checkpoint",
+        json!({
+            "session_key": old["session_key"],
+            "expected_path": old["current_path"],
+            "turn_id": "old-open",
+            "raw_user_input": "旧任务还没完成",
+            "next_actions": ["旧会话待办"]
+        }),
+    );
+
+    let current = invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "current-session", "initial_user_input": "新任务"}),
+    );
+    assert_eq!(current["current_number"], 2);
+    assert_eq!(current["state"]["open_items"], json!([]));
+    assert!(current["state"]["references"]
+        .as_array()
+        .expect("references")
+        .iter()
+        .any(|reference| reference["number"] == 1));
 }
 
 #[test]
@@ -305,6 +398,68 @@ fn search_snippet_handles_unicode_case_expansion_without_invalid_utf8_slicing() 
 }
 
 #[test]
+fn validate_reports_malformed_checkpoint_blocks_without_hiding_valid_sequence() {
+    let (workspace, _harness, ctx) = test_context();
+    invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "malformed-checkpoint", "initial_user_input": "开始"}),
+    );
+    let path = workspace.path().join("docs/history-session/1.md");
+    let mut archive = fs::read_to_string(&path).expect("read archive");
+    archive
+        .push_str("### broken-turn revision-1\n\n```json\n{\"turn_id\": \"broken-turn\",\n```\n");
+    fs::write(&path, archive).expect("write malformed checkpoint");
+
+    let validate = invoke_ok(&ctx, "history_session_validate", json!({"repair": false}));
+    assert_eq!(validate["sequence_valid"], true);
+    assert_eq!(validate["archive_integrity_valid"], false);
+    let malformed = validate["malformed_blocks"]
+        .as_array()
+        .expect("malformed blocks");
+    assert_eq!(malformed.len(), 1);
+    assert_eq!(malformed[0]["path"], "docs/history-session/1.md");
+    assert_eq!(malformed[0]["section"], "checkpoint");
+    assert_eq!(malformed[0]["block_index"], 1);
+    assert!(malformed[0]["line"].as_u64().unwrap_or(0) > 0);
+    assert!(!malformed[0]["error"].as_str().unwrap_or("").is_empty());
+}
+
+#[test]
+fn validate_detects_stale_derived_snapshot_and_repair_commits_a_fresh_snapshot() {
+    let (workspace, _harness, ctx) = test_context();
+    invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "snapshot-freshness", "initial_user_input": "开始"}),
+    );
+    let fresh = invoke_ok(&ctx, "history_session_validate", json!({"repair": false}));
+    assert_eq!(fresh["derived_snapshot_status"], "consistent");
+    assert_eq!(fresh["manifest_fresh"], true);
+    assert_eq!(fresh["state_fresh"], true);
+    assert_eq!(fresh["snapshot_fresh"], true);
+
+    let path = workspace.path().join("docs/history-session/1.md");
+    let mut archive = fs::read_to_string(&path).expect("read archive");
+    archive.push_str("\n手工追加但尚未刷新派生文件的事实。\n");
+    fs::write(&path, archive).expect("mutate archive");
+
+    let stale = invoke_ok(&ctx, "history_session_validate", json!({"repair": false}));
+    assert_eq!(stale["archive_integrity_valid"], true);
+    assert_eq!(stale["derived_snapshot_status"], "stale");
+    assert_eq!(stale["manifest_fresh"], false);
+    assert_eq!(stale["state_fresh"], false);
+    assert_eq!(stale["snapshot_fresh"], false);
+
+    let repaired = invoke_ok(&ctx, "history_session_validate", json!({"repair": true}));
+    assert_eq!(repaired["repaired"], true);
+    assert_eq!(repaired["derived_snapshot_status"], "consistent");
+    assert_eq!(repaired["manifest_fresh"], true);
+    assert_eq!(repaired["state_fresh"], true);
+    assert_eq!(repaired["snapshot_fresh"], true);
+}
+
+#[test]
 fn rebuilds_derived_files_without_changing_existing_archives() {
     let (workspace, _harness, ctx) = test_context();
     prepare_history(workspace.path());
@@ -325,6 +480,8 @@ fn rebuilds_derived_files_without_changing_existing_archives() {
     assert_existing_archives_unchanged(workspace.path(), &before);
     assert!(memory.join("state.json").is_file());
     assert!(memory.join("manifest.json").is_file());
+    assert!(memory.join("snapshot.json").is_file());
+    assert_eq!(validate["derived_snapshot_status"], "consistent");
 }
 
 #[test]

@@ -142,22 +142,18 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
 
     let refreshed = storage::scan(&ctx.workspace, &history_dir)?;
     reject_ambiguous_history(&refreshed)?;
-    let manifest = storage::build_manifest(&refreshed);
-    let previous_state_revision = storage::read_state(&history_dir)
-        .ok()
-        .flatten()
-        .map(|state| state.state_revision)
-        .unwrap_or(0);
-    let state = storage::build_state(
+    if !refreshed.malformed_blocks.is_empty() {
+        warnings.push(
+            "历史档案包含无法解析的结构化记录；有效记录仍可读取，请运行 history_session_validate 查看 malformed_blocks。"
+                .into(),
+        );
+    }
+    let (manifest, state) = storage::refresh_derived(
+        &history_dir,
         &refreshed,
-        &manifest,
         Some(current_number),
         &now_timestamp(),
-        previous_state_revision + 1,
-    );
-    storage::write_index(&history_dir, &storage::rebuild_index(&refreshed))?;
-    storage::write_manifest(&history_dir, &manifest)?;
-    storage::write_state(&history_dir, &state)?;
+    )?;
 
     let mut result = json!({
         "is_new_session": created,
@@ -170,14 +166,17 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "resumed": resumed,
         "initial_input_captured": initial_input_captured,
         "sequence_valid": refreshed.sequence_valid(),
+        "archive_integrity_valid": refreshed.archive_integrity_valid(),
+        "malformed_blocks": refreshed.malformed_blocks,
         "history_count": refreshed.documents.len(),
         "total_history_bytes": refreshed.total_bytes(),
         "state_revision": state.state_revision,
+        "state_revision_monotonic": false,
         "archive_revision": manifest.archive_revision,
         "state": state,
         "history_read_mode": "bounded_state_with_on_demand_search_and_read",
         "persistence_mode": "model_mediated_tool_calls",
-        "assistant_instructions": "Use the bounded state to begin work. To recover exact earlier context, call history_session_search and then history_session_read for only the relevant archive. Preserve session_key and current_path. Before the final response for each user task, call history_session_checkpoint with the user's verbatim raw_user_input. The server can only save text passed as tool arguments and reports missing input explicitly.",
+        "assistant_instructions": "Use the bounded current-session state to begin work. Older sessions are references, not current open items. To recover exact earlier context, call history_session_search and then history_session_read for only the relevant archive. Preserve session_key and current_path. Before the final response for each user task, call history_session_checkpoint with the user's verbatim raw_user_input. Treat persistence as fully complete only when the checkpoint returns persistence_complete=true; a partial checkpoint is still archived but is not a full-fidelity save.",
         "required_next_actions": [
             "review_bounded_state",
             "search_or_read_relevant_archives_when_precision_is_needed",
@@ -273,22 +272,12 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     }
 
     let refreshed = storage::scan(&ctx.workspace, &history_dir)?;
-    let manifest = storage::build_manifest(&refreshed);
-    let state_revision = storage::read_state(&history_dir)
-        .ok()
-        .flatten()
-        .map(|state| state.state_revision + 1)
-        .unwrap_or(1);
-    let state = storage::build_state(
+    let (manifest, state) = storage::refresh_derived(
+        &history_dir,
         &refreshed,
-        &manifest,
         Some(document.number),
         &now_timestamp(),
-        state_revision,
-    );
-    storage::write_index(&history_dir, &storage::rebuild_index(&refreshed))?;
-    storage::write_manifest(&history_dir, &manifest)?;
-    storage::write_state(&history_dir, &state)?;
+    )?;
 
     let mut warnings: Vec<String> = Vec::new();
     if !user_input_captured {
@@ -303,6 +292,11 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             "宿主会话标识已变化；本次仍使用 bootstrap 返回的稳定目标，未切换历史文件。".into(),
         );
     }
+    let fidelity = if user_input_captured {
+        "full"
+    } else {
+        "partial"
+    };
     Ok(tool_ok(json!({
         "session_number": document.number,
         "path": document.path,
@@ -316,9 +310,12 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "updated": updated,
         "duplicate_ignored": duplicate_ignored,
         "user_input_captured": user_input_captured,
+        "fidelity": fidelity,
+        "persistence_complete": user_input_captured,
         "content_hash": storage::sha256(final_content.as_bytes()),
         "archive_revision": manifest.archive_revision,
         "state_revision": state.state_revision,
+        "state_revision_monotonic": false,
         "warnings": warnings
     })))
 }
@@ -472,37 +469,31 @@ pub fn validate(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     if repair {
         storage::ensure_directory(&history_dir)?;
     }
-    let index_status = derived_status(storage::read_index(&history_dir));
-    let manifest_status = derived_status(storage::read_manifest(&history_dir));
-    let state_status = derived_status(storage::read_state(&history_dir));
     let report = storage::scan(&ctx.workspace, &history_dir)?;
     let mut warnings = Vec::<String>::new();
     if !report.duplicate_session_keys.is_empty() {
         warnings.push("存在重复 session_key，相关映射未写入索引。".into());
     }
+    if !report.malformed_blocks.is_empty() {
+        warnings.push(
+            "历史档案包含无法解析的结构化 JSON block；有效记录仍保留，但派生状态可能不完整。"
+                .into(),
+        );
+    }
     let repaired = if repair {
         let _lock = storage::lock_directory(&history_dir)?;
         let locked_report = storage::scan(&ctx.workspace, &history_dir)?;
-        let manifest = storage::build_manifest(&locked_report);
-        let state_revision = storage::read_state(&history_dir)
-            .ok()
-            .flatten()
-            .map(|state| state.state_revision + 1)
-            .unwrap_or(1);
-        let state = storage::build_state(
+        storage::refresh_derived(
+            &history_dir,
             &locked_report,
-            &manifest,
             locked_report.latest_number(),
             &now_timestamp(),
-            state_revision,
-        );
-        storage::write_index(&history_dir, &storage::rebuild_index(&locked_report))?;
-        storage::write_manifest(&history_dir, &manifest)?;
-        storage::write_state(&history_dir, &state)?;
+        )?;
         true
     } else {
         false
     };
+    let statuses = derived_statuses(&history_dir, &report);
     let latest_number = report.latest_number();
     let latest_path = latest_number.and_then(|number| {
         report
@@ -513,18 +504,26 @@ pub fn validate(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     });
     Ok(tool_ok(json!({
         "sequence_valid": report.sequence_valid(),
+        "archive_integrity_valid": report.archive_integrity_valid(),
         "numbers": report.numbers,
         "missing_numbers": report.missing_numbers,
         "duplicate_session_keys": report.duplicate_session_keys,
         "invalid_files": report.invalid_files,
         "empty_files": report.empty_files,
+        "malformed_blocks": report.malformed_blocks,
         "latest_number": latest_number,
         "latest_path": latest_path,
         "archive_count": report.documents.len(),
         "total_archive_bytes": report.total_bytes(),
-        "index_status": index_status,
-        "manifest_status": manifest_status,
-        "state_status": state_status,
+        "index_status": statuses.index,
+        "manifest_status": statuses.manifest,
+        "state_status": statuses.state,
+        "snapshot_status": statuses.snapshot,
+        "index_fresh": statuses.index_fresh,
+        "manifest_fresh": statuses.manifest_fresh,
+        "state_fresh": statuses.state_fresh,
+        "snapshot_fresh": statuses.snapshot_fresh,
+        "derived_snapshot_status": statuses.consistency,
         "repaired": repaired,
         "warnings": warnings
     })))
@@ -669,6 +668,10 @@ fn derived_file_warnings(history_dir: &std::path::Path) -> Vec<String> {
             "memory/state.json",
             storage::read_state(history_dir).map(|value| value.is_some()),
         ),
+        (
+            "memory/snapshot.json",
+            storage::read_snapshot(history_dir).map(|value| value.is_some()),
+        ),
     ] {
         match result {
             Ok(true) => {}
@@ -683,7 +686,74 @@ fn derived_file_warnings(history_dir: &std::path::Path) -> Vec<String> {
     warnings
 }
 
-fn derived_status<T>(result: WorkspaceResult<Option<T>>) -> &'static str {
+struct DerivedStatuses {
+    index: &'static str,
+    manifest: &'static str,
+    state: &'static str,
+    snapshot: &'static str,
+    index_fresh: bool,
+    manifest_fresh: bool,
+    state_fresh: bool,
+    snapshot_fresh: bool,
+    consistency: &'static str,
+}
+
+fn derived_statuses(history_dir: &std::path::Path, report: &model::ScanReport) -> DerivedStatuses {
+    let expected_index = storage::rebuild_index(report);
+    let expected_manifest = storage::build_manifest(report);
+    let index = storage::read_index(history_dir);
+    let manifest = storage::read_manifest(history_dir);
+    let state = storage::read_state(history_dir);
+    let snapshot = storage::read_snapshot(history_dir);
+
+    let index_status = derived_status_ref(&index);
+    let manifest_status = derived_status_ref(&manifest);
+    let state_status = derived_status_ref(&state);
+    let snapshot_status = derived_status_ref(&snapshot);
+    let index_fresh = matches!(&index, Ok(Some(value)) if value == &expected_index);
+    let manifest_fresh = matches!(
+        &manifest,
+        Ok(Some(value)) if value.archive_revision == expected_manifest.archive_revision
+    );
+    let state_fresh = matches!(
+        &state,
+        Ok(Some(value)) if value.version >= 3
+            && value.archive_revision == expected_manifest.archive_revision
+    );
+    let snapshot_fresh = matches!(
+        (&snapshot, &state),
+        (Ok(Some(snapshot)), Ok(Some(state)))
+            if snapshot.version == 1
+                && snapshot.archive_revision == expected_manifest.archive_revision
+                && snapshot.state_revision == state.state_revision
+                && state_fresh
+    );
+    let consistency = if [index_status, manifest_status, state_status, snapshot_status]
+        .contains(&"invalid")
+    {
+        "invalid"
+    } else if [index_status, manifest_status, state_status, snapshot_status].contains(&"missing") {
+        "incomplete"
+    } else if index_fresh && manifest_fresh && state_fresh && snapshot_fresh {
+        "consistent"
+    } else {
+        "stale"
+    };
+
+    DerivedStatuses {
+        index: index_status,
+        manifest: manifest_status,
+        state: state_status,
+        snapshot: snapshot_status,
+        index_fresh,
+        manifest_fresh,
+        state_fresh,
+        snapshot_fresh,
+        consistency,
+    }
+}
+
+fn derived_status_ref<T>(result: &WorkspaceResult<Option<T>>) -> &'static str {
     match result {
         Ok(Some(_)) => "valid",
         Ok(None) => "missing",

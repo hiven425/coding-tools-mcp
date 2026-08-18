@@ -20,6 +20,7 @@
   import { startCloseGuard } from "$lib/close-guard";
   import CloseConfirmDialog from "$lib/components/CloseConfirmDialog.svelte";
   import type { RuntimeState } from "$lib/types";
+  import { Activity } from "@lucide/svelte";
 
   let { children } = $props();
   let closeConfirmOpen = $state(false);
@@ -81,6 +82,10 @@
     goto("/settings/general");
   }
 
+  function openActivity() {
+    goto("/activity");
+  }
+
   function openKeysSettings() {
     goto("/settings/keys");
   }
@@ -111,6 +116,14 @@
 
 <AppShell onAddWorkspace={addWorkspace}>
   {#snippet settingsNav()}
+    <button
+      type="button"
+      class="tx-settings-link flex items-center gap-2 {$page.url.pathname === '/activity' ? 'active' : ''}"
+      onclick={openActivity}
+    >
+      <Activity size={15} strokeWidth={2} />
+      <span>活动监控</span>
+    </button>
     <button
       type="button"
       class="tx-settings-link {$page.url.pathname === '/settings/general' ? 'active' : ''}"

@@ -80,6 +80,37 @@ export interface RuntimeStatus {
   publicError: string | null;
 }
 
+export interface ActivityTrace {
+  traceId: string;
+  rpcId: string;
+  method: string;
+  tool: string;
+  route: string;
+  workspaceId: string;
+  workspaceName: string;
+  status: "running" | "completed" | "failed" | string;
+  startedAtMs: number;
+  finishedAtMs: number | null;
+  durationMs: number | null;
+  request: unknown;
+  response: unknown;
+  error: unknown;
+}
+
+export interface ActivitySnapshot {
+  traces: ActivityTrace[];
+  totalMatching: number;
+  retained: number;
+  maxEntries: number;
+}
+
+export interface ActivityFilters {
+  workspace?: string;
+  tool?: string;
+  status?: string;
+  limit?: number;
+}
+
 export function actionsConfig(profile: WorkspaceProfile): ActionsConfig {
   return {
     public_url: "",

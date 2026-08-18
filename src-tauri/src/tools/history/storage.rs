@@ -10,8 +10,8 @@ use crate::tools::workspace::{relative_display, Workspace, WorkspaceError, Works
 
 use super::markdown;
 use super::model::{
-    HistoryDocument, HistoryIndex, IndexEntry, ManifestEntry, MemoryManifest, MemoryReference,
-    MemoryState, ScanReport,
+    DerivedSnapshot, HistoryDocument, HistoryIndex, IndexEntry, MalformedHistoryBlock,
+    ManifestEntry, MemoryManifest, MemoryReference, MemoryState, ScanReport,
 };
 
 pub const DEFAULT_HISTORY_DIR: &str = "docs/history-session";
@@ -160,9 +160,22 @@ pub fn scan(workspace: &Workspace, history_dir: &Path) -> WorkspaceResult<ScanRe
         if content.trim().is_empty() {
             report.empty_files.push(name.clone());
         }
+        let relative_path = relative_display(workspace.root(), &path);
+        append_parse_diagnostics(
+            &mut report,
+            &relative_path,
+            "initial_input",
+            markdown::parse_initial_input_records_with_diagnostics(&content).diagnostics,
+        );
+        append_parse_diagnostics(
+            &mut report,
+            &relative_path,
+            "checkpoint",
+            markdown::parse_checkpoint_records_with_diagnostics(&content).diagnostics,
+        );
         report.documents.push(HistoryDocument {
             number,
-            path: relative_display(workspace.root(), &path),
+            path: relative_path,
             session_key: markdown::metadata(&content, "Session key"),
             created_at: markdown::metadata(&content, "Created"),
             updated_at: markdown::metadata(&content, "Updated"),
@@ -196,6 +209,27 @@ pub fn scan(workspace: &Workspace, history_dir: &Path) -> WorkspaceResult<ScanRe
         .filter_map(|(key, count)| (count > 1).then_some(key))
         .collect();
     Ok(report)
+}
+
+fn append_parse_diagnostics(
+    report: &mut ScanReport,
+    path: &str,
+    section: &str,
+    diagnostics: Vec<markdown::JsonBlockDiagnostic>,
+) {
+    report
+        .malformed_blocks
+        .extend(
+            diagnostics
+                .into_iter()
+                .map(|diagnostic| MalformedHistoryBlock {
+                    path: path.to_string(),
+                    section: section.to_string(),
+                    block_index: diagnostic.block_index,
+                    line: diagnostic.line,
+                    error: diagnostic.error,
+                }),
+        );
 }
 
 pub fn rebuild_index(report: &ScanReport) -> HistoryIndex {
@@ -241,6 +275,22 @@ pub fn write_index(history_dir: &Path, index: &HistoryIndex) -> WorkspaceResult<
 
 pub fn memory_dir(history_dir: &Path) -> PathBuf {
     history_dir.join("memory")
+}
+
+pub fn read_snapshot(history_dir: &Path) -> WorkspaceResult<Option<DerivedSnapshot>> {
+    read_json(
+        &memory_dir(history_dir).join("snapshot.json"),
+        "HISTORY_SNAPSHOT_INVALID",
+        "History derived snapshot",
+    )
+}
+
+pub fn write_snapshot(history_dir: &Path, snapshot: &DerivedSnapshot) -> WorkspaceResult<()> {
+    write_json(
+        &memory_dir(history_dir).join("snapshot.json"),
+        snapshot,
+        "history derived snapshot",
+    )
 }
 
 pub fn read_manifest(history_dir: &Path) -> WorkspaceResult<Option<MemoryManifest>> {
@@ -322,28 +372,31 @@ pub fn build_state(
                 .map(|document| markdown::document_title(&document.content, document.number))
         })
         .unwrap_or_else(|| "尚未记录当前焦点".to_string());
+    let records = current_document
+        .map(|document| markdown::parse_checkpoint_records(&document.content))
+        .unwrap_or_default();
+    let latest = latest_revisions(&records);
     let mut recent_changes = Vec::new();
+    for record in latest.iter().rev() {
+        push_bounded(
+            &mut recent_changes,
+            record.files_changed.iter().map(String::as_str),
+        );
+        push_bounded(
+            &mut recent_changes,
+            record.decisions.iter().map(String::as_str),
+        );
+    }
     let mut open_items = Vec::new();
-    for document in report.documents.iter().rev() {
-        let records = markdown::parse_checkpoint_records(&document.content);
-        for record in latest_revisions(&records).into_iter().rev() {
-            push_bounded(
-                &mut recent_changes,
-                record.files_changed.iter().map(String::as_str),
-            );
-            push_bounded(
-                &mut recent_changes,
-                record.decisions.iter().map(String::as_str),
-            );
-            push_bounded(
-                &mut open_items,
-                record.remaining_issues.iter().map(String::as_str),
-            );
-            push_bounded(
-                &mut open_items,
-                record.next_actions.iter().map(String::as_str),
-            );
-        }
+    if let Some(record) = latest.last() {
+        push_bounded(
+            &mut open_items,
+            record.remaining_issues.iter().map(String::as_str),
+        );
+        push_bounded(
+            &mut open_items,
+            record.next_actions.iter().map(String::as_str),
+        );
     }
     let references = manifest
         .entries
@@ -358,10 +411,12 @@ pub fn build_state(
         })
         .collect();
     MemoryState {
-        version: 2,
+        version: 3,
         state_revision,
         archive_revision: manifest.archive_revision.clone(),
         generated_at: timestamp.to_string(),
+        projection_scope: "current_session_latest_checkpoint".into(),
+        state_revision_semantics: "local_derived_generation_not_monotonic".into(),
         current_session: current_number.and_then(|number| {
             manifest
                 .entries
@@ -376,8 +431,48 @@ pub fn build_state(
         current_focus: truncate_text(&current_focus, STATE_FOCUS_LIMIT),
         recent_changes,
         open_items,
+        open_items_source: (!latest.is_empty())
+            .then(|| {
+                current_number.and_then(|number| {
+                    manifest
+                        .entries
+                        .iter()
+                        .find(|entry| entry.number == number)
+                        .map(|entry| MemoryReference {
+                            number: entry.number,
+                            path: entry.path.clone(),
+                            reason: "当前 session 最新 checkpoint 的未决事项快照".into(),
+                        })
+                })
+            })
+            .flatten(),
         references,
     }
+}
+
+pub fn refresh_derived(
+    history_dir: &Path,
+    report: &ScanReport,
+    current_number: Option<u64>,
+    timestamp: &str,
+) -> WorkspaceResult<(MemoryManifest, MemoryState)> {
+    let manifest = build_manifest(report);
+    let revision = read_state(history_dir)
+        .ok()
+        .flatten()
+        .map(|state| state.state_revision + 1)
+        .unwrap_or(1);
+    let state = build_state(report, &manifest, current_number, timestamp, revision);
+    let snapshot = DerivedSnapshot {
+        version: 1,
+        archive_revision: manifest.archive_revision.clone(),
+        state_revision: state.state_revision,
+    };
+    write_index(history_dir, &rebuild_index(report))?;
+    write_manifest(history_dir, &manifest)?;
+    write_state(history_dir, &state)?;
+    write_snapshot(history_dir, &snapshot)?;
+    Ok((manifest, state))
 }
 
 fn latest_user_focus(content: &str) -> Option<String> {
@@ -402,17 +497,15 @@ fn latest_user_focus(content: &str) -> Option<String> {
 fn latest_revisions(
     records: &[super::model::CheckpointRecord],
 ) -> Vec<&super::model::CheckpointRecord> {
-    let mut latest = BTreeMap::new();
-    for record in records {
-        let should_replace = latest
-            .get(record.turn_id.as_str())
-            .map(|existing: &&super::model::CheckpointRecord| record.revision >= existing.revision)
-            .unwrap_or(true);
-        if should_replace {
-            latest.insert(record.turn_id.as_str(), record);
+    let mut seen = BTreeSet::new();
+    let mut latest = Vec::new();
+    for record in records.iter().rev() {
+        if seen.insert(record.turn_id.as_str()) {
+            latest.push(record);
         }
     }
-    latest.into_values().collect()
+    latest.reverse();
+    latest
 }
 
 fn push_bounded<'a>(target: &mut Vec<String>, values: impl Iterator<Item = &'a str>) {

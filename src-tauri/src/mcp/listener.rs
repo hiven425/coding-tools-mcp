@@ -14,17 +14,18 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 use tower_http::cors::CorsLayer;
 
+use crate::activity::ActivityStore;
 use crate::auth::{
     authorization_server_metadata, authorize_get, authorize_post, external_base_url,
     protected_resource_metadata, protected_resource_metadata_url, token_exchange,
-    verify_bearer_header, verify_oauth_bearer_header_with_metadata, AuthorizeForm,
-    AuthorizeParams, OAuthRuntime, TokenForm,
+    verify_bearer_header, verify_oauth_bearer_header_with_metadata, AuthorizeForm, AuthorizeParams,
+    OAuthRuntime, TokenForm,
 };
 use crate::mcp::server::{handle_request, new_state, SharedState};
 use crate::secret::SecretStore;
+use crate::tools::policy::PolicySettings;
 use crate::tools::Workspace;
 use crate::tunnel::{append_profile_log, new_trace_id, sanitize_log_line};
-use crate::tools::policy::PolicySettings;
 use crate::workspace::{AuthConfig, RuntimeConfig};
 
 pub type ShutdownSender = oneshot::Sender<()>;
@@ -43,6 +44,7 @@ struct ListenerState {
     mcp: SharedState,
     auth: AuthConfig,
     workspace_id: String,
+    workspace_name: String,
     workspace_path: String,
     bind_port: u16,
     configured_public_url: String,
@@ -50,6 +52,7 @@ struct ListenerState {
     oauth: Option<Arc<OAuthRuntime>>,
     oauth_client_secret: Option<String>,
     transport_v2: bool,
+    activity: Arc<ActivityStore>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -57,6 +60,7 @@ pub fn spawn_listener(
     port: u16,
     workspace_path: PathBuf,
     workspace_id: String,
+    workspace_name: String,
     auth: AuthConfig,
     public_base_url: String,
     oauth_client_secret: Option<String>,
@@ -64,6 +68,7 @@ pub fn spawn_listener(
     oauth_token_secret: Option<String>,
     runtime: RuntimeConfig,
     transport_v2: bool,
+    activity: Arc<ActivityStore>,
 ) -> Result<(ShutdownSender, tauri::async_runtime::JoinHandle<()>), String> {
     let workspace_display = workspace_path.display().to_string();
     let workspace = Workspace::new(workspace_path).map_err(|e| e.message())?;
@@ -89,11 +94,7 @@ pub fn spawn_listener(
     let oauth = if auth.oauth_enabled() {
         let password = oauth_password.unwrap_or_default();
         let token_secret = oauth_token_secret.unwrap_or_default();
-        let oauth_base = external_base_url(
-            &HeaderMap::new(),
-            port,
-            &configured_public_url,
-        );
+        let oauth_base = external_base_url(&HeaderMap::new(), port, &configured_public_url);
         Some(Arc::new(OAuthRuntime::new(
             oauth_base,
             auth.oauth_client_id.clone(),
@@ -108,6 +109,7 @@ pub fn spawn_listener(
         mcp,
         auth,
         workspace_id,
+        workspace_name,
         workspace_path: workspace_display,
         bind_port: port,
         configured_public_url,
@@ -115,6 +117,7 @@ pub fn spawn_listener(
         oauth,
         oauth_client_secret,
         transport_v2,
+        activity,
     };
     let trace_id = new_trace_id();
     let started_at = Instant::now();
@@ -149,7 +152,10 @@ pub fn spawn_listener(
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let profile_id = state.workspace_id.clone();
     let handle = tauri::async_runtime::spawn(async move {
-        let result = serve(listener, port, state, shutdown_rx).await;
+        let result = match tokio::net::TcpListener::from_std(listener) {
+            Ok(listener) => serve(listener, port, state, shutdown_rx).await,
+            Err(error) => Err(format!("MCP 本地监听器初始化失败: {error}").into()),
+        };
         if let Err(err) = &result {
             append_profile_log(
                 &profile_id,
@@ -159,7 +165,10 @@ pub fn spawn_listener(
                     started_at.elapsed().as_millis()
                 ),
             );
-            eprintln!("mcp listener stopped: {}", sanitize_log_line(&err.to_string()));
+            eprintln!(
+                "mcp listener stopped: {}",
+                sanitize_log_line(&err.to_string())
+            );
         } else {
             append_profile_log(
                 &profile_id,
@@ -213,7 +222,10 @@ fn listener_router(state: ListenerState) -> Router {
             "/.well-known/oauth-protected-resource",
             get(oauth_protected_resource_metadata),
         )
-        .route("/oauth/authorize", get(oauth_authorize_get).post(oauth_authorize_post))
+        .route(
+            "/oauth/authorize",
+            get(oauth_authorize_get).post(oauth_authorize_post),
+        )
         .route("/oauth/token", post(oauth_token_post));
     let router = if transport_v2 {
         router.route(
@@ -223,20 +235,17 @@ fn listener_router(state: ListenerState) -> Router {
     } else {
         router
     };
-    router
-        .with_state(state)
-        .layer(CorsLayer::permissive())
+    router.with_state(state).layer(CorsLayer::permissive())
 }
 
-fn bind_listener(port: u16) -> Result<tokio::net::TcpListener, String> {
+fn bind_listener(port: u16) -> Result<std::net::TcpListener, String> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = std::net::TcpListener::bind(addr)
         .map_err(|err| format!("MCP 本地端口 {port} 绑定失败: {err}"))?;
     listener
         .set_nonblocking(true)
         .map_err(|err| format!("MCP 本地端口 {port} 设置非阻塞失败: {err}"))?;
-    tokio::net::TcpListener::from_std(listener)
-        .map_err(|err| format!("MCP 本地监听器初始化失败: {err}"))
+    Ok(listener)
 }
 
 fn resolve_oauth_base(state: &ListenerState, headers: &HeaderMap) -> String {
@@ -311,15 +320,24 @@ async fn mcp_post(
         ),
     );
 
+    let activity_trace_id =
+        state
+            .activity
+            .begin_trace(&state.workspace_id, &state.workspace_name, "/mcp", &body);
     let mcp = state.mcp.clone();
     let profile_id = state.workspace_id.clone();
+    let activity = state.activity.clone();
     let result = tokio::task::spawn_blocking(move || handle_request(&mcp, &body)).await;
     match result {
         Ok(response) => {
+            activity.complete_trace(&activity_trace_id, &response);
             append_profile_log(
                 &profile_id,
                 "mcp-requests.log",
-                &format!("[rpc] completed id={} method={} tool={}", request_id, method, tool_name),
+                &format!(
+                    "[rpc] completed id={} method={} tool={}",
+                    request_id, method, tool_name
+                ),
             );
             if tool_name == "exec_command" || tool_name == "exec_health_check" {
                 let structured = response
@@ -358,6 +376,7 @@ async fn mcp_post(
             }
         }
         Err(error) => {
+            activity.fail_trace(&activity_trace_id, &error.to_string());
             append_profile_log(
                 &profile_id,
                 "mcp-requests.log",
@@ -507,7 +526,10 @@ async fn oauth_protected_resource_metadata(
     if !state.auth.oauth_enabled() {
         return oauth_not_configured();
     }
-    Json(protected_resource_metadata(&resolve_oauth_base(&state, &headers))).into_response()
+    Json(protected_resource_metadata(&resolve_oauth_base(
+        &state, &headers,
+    )))
+    .into_response()
 }
 
 async fn oauth_authorize_get(
@@ -517,11 +539,7 @@ async fn oauth_authorize_get(
     let Some(oauth) = state.oauth.as_ref() else {
         return oauth_not_configured();
     };
-    authorize_get(
-        oauth,
-        params,
-        Some(state.workspace_path.as_str()),
-    )
+    authorize_get(oauth, params, Some(state.workspace_path.as_str()))
 }
 
 async fn oauth_authorize_post(
@@ -547,12 +565,7 @@ async fn oauth_token_post(
         )
             .into_response();
     };
-    token_exchange(
-        oauth,
-        &headers,
-        form,
-        &resolve_oauth_base(&state, &headers),
-    )
+    token_exchange(oauth, &headers, form, &resolve_oauth_base(&state, &headers))
 }
 
 fn oauth_not_configured() -> Response {
@@ -593,6 +606,7 @@ mod tests {
                 mcp,
                 auth,
                 workspace_id: "workspace-test".into(),
+                workspace_name: "Workspace Test".into(),
                 workspace_path: workspace.path().to_string_lossy().into_owned(),
                 bind_port: 28_766,
                 configured_public_url: "https://fixed.example.invalid".into(),
@@ -600,6 +614,7 @@ mod tests {
                 oauth: None,
                 oauth_client_secret: None,
                 transport_v2: true,
+                activity: Arc::new(crate::activity::ActivityStore::new()),
             },
             workspace,
             harness,
@@ -730,15 +745,16 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 
         let mut request = mcp_request(Method::POST, Some(request_body.clone()));
-        request.headers_mut().insert("accept", "text/plain".parse().unwrap());
+        request
+            .headers_mut()
+            .insert("accept", "text/plain".parse().unwrap());
         let response = app.clone().oneshot(request).await.expect("accept response");
         assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
 
         let mut request = mcp_request(Method::POST, Some(request_body));
-        request.headers_mut().insert(
-            MCP_PROTOCOL_VERSION_HEADER,
-            "2099-01-01".parse().unwrap(),
-        );
+        request
+            .headers_mut()
+            .insert(MCP_PROTOCOL_VERSION_HEADER, "2099-01-01".parse().unwrap());
         let response = app.oneshot(request).await.expect("protocol response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
@@ -795,8 +811,7 @@ mod tests {
             let body = to_bytes(response.into_body(), usize::MAX)
                 .await
                 .expect("metadata body");
-            let metadata: serde_json::Value =
-                serde_json::from_slice(&body).expect("metadata json");
+            let metadata: serde_json::Value = serde_json::from_slice(&body).expect("metadata json");
             assert_eq!(metadata["resource"], "https://fixed.example.invalid/mcp");
             assert_eq!(
                 metadata["authorization_servers"],

@@ -95,10 +95,33 @@ export interface ActivityTrace {
   request: unknown;
   response: unknown;
   error: unknown;
+  operationId: string;
+  processSessionId: string;
+  parentTraceId: string;
+}
+
+export interface ActivityProcess {
+  sessionId: string;
+  operationId: string;
+  traceId: string;
+  workspaceName: string;
+  command: string;
+  status: string;
+  startedAtMs: number;
+  updatedAtMs: number;
+  exitCode: number | null;
+}
+
+export interface ActivityEvent {
+  kind: string;
+  trace: ActivityTrace | null;
+  process: ActivityProcess | null;
 }
 
 export interface ActivitySnapshot {
   traces: ActivityTrace[];
+  activeProcesses: ActivityProcess[];
+  activeRequests: number;
   totalMatching: number;
   retained: number;
   maxEntries: number;

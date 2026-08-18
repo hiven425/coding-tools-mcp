@@ -1,5 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ActivityFilters, ActivitySnapshot, ActivityTrace } from "$lib/types";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type {
+  ActivityEvent,
+  ActivityFilters,
+  ActivitySnapshot,
+  ActivityTrace,
+} from "$lib/types";
 
 export function listActivity(filters: ActivityFilters = {}): Promise<ActivitySnapshot> {
   return invoke<ActivitySnapshot>("list_activity", {
@@ -16,4 +22,10 @@ export function getActivity(traceId: string): Promise<ActivityTrace | null> {
 
 export function clearActivity(): Promise<number> {
   return invoke<number>("clear_activity");
+}
+
+export function listenActivityEvents(
+  handler: (event: ActivityEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<ActivityEvent>("activity://event", ({ payload }) => handler(payload));
 }

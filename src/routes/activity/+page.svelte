@@ -11,13 +11,22 @@
     RefreshCw,
     Trash2,
   } from "@lucide/svelte";
-  import { clearActivity, getActivity, listActivity } from "$lib/api/activity";
+  import {
+    clearActivity,
+    getActivity,
+    listActivity,
+    listenActivityEvents,
+  } from "$lib/api/activity";
+  import ActivityProcessPanel from "$lib/components/ActivityProcessPanel.svelte";
+  import ActivityServiceHealth from "$lib/components/ActivityServiceHealth.svelte";
   import { workspaces } from "$lib/stores/app";
   import { showToast } from "$lib/stores/toast";
   import type { ActivitySnapshot, ActivityTrace } from "$lib/types";
 
   const EMPTY_SNAPSHOT: ActivitySnapshot = {
     traces: [],
+    activeProcesses: [],
+    activeRequests: 0,
     totalMatching: 0,
     retained: 0,
     maxEntries: 500,
@@ -31,12 +40,17 @@
   let workspaceFilter = $state("");
   let toolFilter = $state("");
   let statusFilter = $state("");
+  let reloadQueued = false;
+  let eventRefreshTimer: number | undefined;
 
-  const runningCount = $derived(snapshot.traces.filter((trace) => trace.status === "running").length);
+  const runningCount = $derived(snapshot.activeRequests);
   const failedCount = $derived(snapshot.traces.filter((trace) => trace.status === "failed").length);
 
   async function load(reportError = true) {
-    if (refreshing) return;
+    if (refreshing) {
+      reloadQueued = true;
+      return;
+    }
     refreshing = true;
     try {
       snapshot = await listActivity({
@@ -55,7 +69,20 @@
     } finally {
       refreshing = false;
       loading = false;
+      if (reloadQueued && !document.hidden) {
+        reloadQueued = false;
+        void load(false);
+      }
     }
+  }
+
+  function scheduleEventRefresh() {
+    if (document.hidden) return;
+    if (eventRefreshTimer !== undefined) window.clearTimeout(eventRefreshTimer);
+    eventRefreshTimer = window.setTimeout(() => {
+      eventRefreshTimer = undefined;
+      void load(false);
+    }, 150);
   }
 
   async function selectTrace(trace: ActivityTrace) {
@@ -119,25 +146,44 @@
   }
 
   function statusLabel(status: string): string {
-    if (status === "running") return "运行中";
+    if (status === "running") return "请求处理中";
     if (status === "completed") return "已完成";
     if (status === "failed") return "失败";
     return status || "未知";
   }
 
   onMount(() => {
+    let disposed = false;
+    let stopEvents: (() => void) | undefined;
     void load();
+    void listenActivityEvents(scheduleEventRefresh)
+      .then((unlisten) => {
+        if (disposed) unlisten();
+        else stopEvents = unlisten;
+      })
+      .catch(() => {
+        // Web preview and older desktop builds fall back to periodic snapshots.
+      });
     const onVisibility = () => {
-      if (!document.hidden) void load(false);
+      if (!document.hidden) {
+        now = Date.now();
+        void load(false);
+      }
     };
     document.addEventListener("visibilitychange", onVisibility);
-    const timer = window.setInterval(() => {
-      now = Date.now();
+    const clockTimer = window.setInterval(() => {
+      if (!document.hidden) now = Date.now();
+    }, 1_000);
+    const fallbackTimer = window.setInterval(() => {
       if (!document.hidden) void load(false);
-    }, 5_000);
+    }, 15_000);
     return () => {
+      disposed = true;
+      stopEvents?.();
       document.removeEventListener("visibilitychange", onVisibility);
-      window.clearInterval(timer);
+      window.clearInterval(clockTimer);
+      window.clearInterval(fallbackTimer);
+      if (eventRefreshTimer !== undefined) window.clearTimeout(eventRefreshTimer);
     };
   });
 </script>
@@ -148,7 +194,7 @@
       <p class="page-kicker">运行诊断</p>
       <div class="activity-title-row">
         <h2 class="page-title">MCP 活动</h2>
-        <span class="activity-live"><span></span>{runningCount > 0 ? `${runningCount} 运行中` : "已就绪"}</span>
+        <span class="activity-live" class:active={runningCount > 0}><span></span>{runningCount > 0 ? `${runningCount} 请求处理中` : "无进行中请求"}</span>
       </div>
     </div>
     <div class="activity-actions">
@@ -181,6 +227,11 @@
       <span><LoaderCircle size={15} />运行 <strong>{runningCount}</strong></span>
       <span class:has-failures={failedCount > 0}><CircleAlert size={15} />失败 <strong>{failedCount}</strong></span>
       <span><CheckCircle2 size={15} />匹配 <strong>{snapshot.totalMatching}</strong></span>
+    </div>
+
+    <div class="activity-observability">
+      <ActivityServiceHealth workspaces={$workspaces} />
+      <ActivityProcessPanel processes={snapshot.activeProcesses} {now} />
     </div>
 
     <form
@@ -280,6 +331,9 @@
             <div><dt>路由</dt><dd class="tx-mono">{selected.route}</dd></div>
             <div><dt>开始</dt><dd class="tx-mono">{formatTime(selected.startedAtMs)}</dd></div>
             <div><dt>耗时</dt><dd class="tx-mono">{formatDuration(durationMs(selected))}</dd></div>
+            {#if selected.operationId}<div><dt>操作</dt><dd class="tx-mono">{selected.operationId}</dd></div>{/if}
+            {#if selected.processSessionId}<div><dt>会话</dt><dd class="tx-mono">{selected.processSessionId}</dd></div>{/if}
+            {#if selected.parentTraceId}<div><dt>父调用</dt><dd class="tx-mono">{selected.parentTraceId}</dd></div>{/if}
           </dl>
           <div class="activity-payloads">
             <section>
@@ -311,13 +365,15 @@
   .activity-title-row, .activity-actions, .activity-summary, .activity-filters { display: flex; align-items: center; }
   .activity-title-row { gap: 12px; }
   .activity-live { display: inline-flex; align-items: center; gap: 6px; color: var(--text-secondary); font-size: 12px; }
-  .activity-live span { width: 7px; height: 7px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 16%, transparent); }
+  .activity-live span { width: 7px; height: 7px; border-radius: 50%; background: var(--text-muted); }
+  .activity-live.active span { background: var(--warning); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning) 16%, transparent); }
   .activity-actions { gap: 8px; }
   .activity-icon-button { width: 36px; height: 36px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 36px; border: 1px solid var(--border); border-radius: 8px; background: var(--card-bg); color: var(--text-secondary); cursor: pointer; }
   .activity-icon-button:hover:not(:disabled) { color: var(--text-main); background: var(--surface-hover); }
   .activity-icon-button.danger:hover:not(:disabled) { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 35%, var(--border)); }
   .activity-icon-button:disabled { opacity: 0.45; cursor: default; }
   .activity-body { display: grid; gap: 14px; min-width: 0; }
+  .activity-observability { display: grid; grid-template-columns: minmax(520px, 1.35fr) minmax(300px, .65fr); gap: 14px; min-width: 0; }
   .activity-summary { gap: 20px; flex-wrap: wrap; min-height: 26px; color: var(--text-secondary); font-size: 12px; }
   .activity-summary span { display: inline-flex; align-items: center; gap: 6px; }
   .activity-summary strong { color: var(--text-main); font-variant-numeric: tabular-nums; }
@@ -361,6 +417,6 @@
   .activity-payloads pre { max-height: 230px; margin: 0; padding: 10px; overflow: auto; border: 1px solid var(--border); border-radius: 6px; background: var(--page-bg); color: var(--text-main); font-family: "Cascadia Code", Consolas, monospace; font-size: 11px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
   .activity-empty { min-height: 180px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--text-muted); font-size: 12px; }
   .detail-empty { flex: 1; min-height: 300px; flex-direction: column; }
-  @media (max-width: 1100px) { .activity-console { grid-template-columns: 1fr; max-height: none; } .activity-list { min-height: 430px; border-right: 0; border-bottom: 1px solid var(--border); } .activity-detail { min-height: 430px; } }
+  @media (max-width: 1100px) { .activity-observability, .activity-console { grid-template-columns: 1fr; } .activity-console { max-height: none; } .activity-list { min-height: 430px; border-right: 0; border-bottom: 1px solid var(--border); } .activity-detail { min-height: 430px; } }
   @media (max-width: 760px) { .activity-header { align-items: flex-start; } .activity-filters { grid-template-columns: 1fr 1fr; } .activity-filters label:first-child { grid-column: 1 / -1; } .activity-console { min-height: 0; } .activity-body { padding: 16px; } }
 </style>

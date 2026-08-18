@@ -1,6 +1,8 @@
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
-use crate::settings::AppSettings;
+use crate::settings::{AppSettings, FixedDomainConfigProvider};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceProfile {
@@ -30,6 +32,8 @@ pub struct TunnelConfig {
     pub frp_server_port: u16,
     #[serde(default = "default_cloudflare_mode")]
     pub cloudflare_mode: String,
+    #[serde(default)]
+    pub mcp_transport_v2: bool,
     /// When true, apply global proxy from Settings → General when starting the tunnel.
     #[serde(default = "default_use_proxy")]
     pub use_proxy: bool,
@@ -113,6 +117,8 @@ pub struct RuntimeStatusDto {
     pub public_message: String,
     pub local_endpoint: String,
     pub public_endpoint: String,
+    pub public_state: String,
+    pub public_error: Option<String>,
 }
 
 fn default_tunnel_type() -> String {
@@ -192,6 +198,7 @@ impl Default for TunnelConfig {
             frp_profile_id: String::new(),
             frp_server_port: default_frp_server_port(),
             cloudflare_mode: default_cloudflare_mode(),
+            mcp_transport_v2: false,
             use_proxy: default_use_proxy(),
         }
     }
@@ -278,6 +285,17 @@ impl WorkspaceProfile {
     }
 
     pub fn effective_public_url_with(&self, settings: &AppSettings) -> String {
+        if self.tunnel.tunnel_type == "cloudflare" && self.tunnel.cloudflare_mode == "named" {
+            let provider = FixedDomainConfigProvider::new(Path::new(&self.path));
+            if self.tunnel.mcp_transport_v2 {
+                if let Ok(Some(endpoints)) =
+                    provider.resolve_hostname(Some(&self.tunnel.public_url))
+                {
+                    return endpoints.origin().to_string();
+                }
+            }
+        }
+
         computed_public_url(
             &self.tunnel.tunnel_type,
             &self.tunnel.frp_server,
@@ -376,4 +394,21 @@ fn computed_public_url(
         }
     }
     public_url.trim_end_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TunnelConfig;
+
+    #[test]
+    fn legacy_tunnel_config_defaults_transport_v2_off() {
+        let config: TunnelConfig = serde_json::from_value(serde_json::json!({
+            "type": "cloudflare",
+            "cloudflare_mode": "named",
+            "public_url": "https://legacy.example.invalid"
+        }))
+        .expect("deserialize legacy tunnel config");
+
+        assert!(!config.mcp_transport_v2);
+    }
 }

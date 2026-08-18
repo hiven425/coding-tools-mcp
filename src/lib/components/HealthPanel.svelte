@@ -12,6 +12,19 @@
   let busy = $state(false);
   let error = $state("");
 
+  function statusLabel(item: HealthItem): string {
+    switch (item.status) {
+      case "pass":
+        return "通过";
+      case "warn":
+        return "需认证";
+      case "skip":
+        return "跳过";
+      default:
+        return "失败";
+    }
+  }
+
   async function runCheck() {
     if (busy || !workspaceId) return;
     busy = true;
@@ -53,23 +66,25 @@
 
   {#if items.length > 0}
     <ul class="mt-4 grid gap-2">
-      {#each items as item (item.label)}
+      {#each items as item (item.key)}
         <li
           class="flex items-start justify-between gap-3 rounded-lg bg-[var(--color-bg)] px-3 py-2"
         >
           <div class="min-w-0">
             <p class="text-sm font-medium">{item.label}</p>
             <p class="mt-0.5 text-xs text-[var(--color-text-muted)]">{item.detail}</p>
-            {#if !item.ok && item.hint}
+            {#if (item.status === "fail" || item.status === "warn") && item.hint}
               <p class="mt-1 text-xs text-[var(--color-accent)]">{item.hint}</p>
             {/if}
           </div>
           <span
             class="shrink-0 rounded-sm px-2 py-0.5 text-xs font-medium"
-            class:health-ok={item.ok}
-            class:health-fail={!item.ok}
+            class:health-ok={item.status === "pass"}
+            class:health-warn={item.status === "warn"}
+            class:health-skip={item.status === "skip"}
+            class:health-fail={item.status === "fail"}
           >
-            {item.ok ? "通过" : "失败"}
+            {statusLabel(item)}
           </span>
         </li>
       {/each}
@@ -88,5 +103,15 @@
   .health-fail {
     background: color-mix(in oklch, var(--color-error) 15%, transparent);
     color: var(--color-error);
+  }
+
+  .health-warn {
+    background: color-mix(in oklch, var(--color-warning) 16%, transparent);
+    color: var(--color-warning);
+  }
+
+  .health-skip {
+    background: color-mix(in oklch, var(--color-text-muted) 12%, transparent);
+    color: var(--color-text-muted);
   }
 </style>

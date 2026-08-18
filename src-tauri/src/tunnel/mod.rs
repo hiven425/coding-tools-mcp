@@ -2,6 +2,7 @@ mod access;
 mod cloudflare;
 mod download;
 mod frp;
+mod logs;
 mod software;
 mod supervisor;
 
@@ -10,7 +11,7 @@ use crate::workspace::WorkspaceProfile;
 
 pub use access::{
     cleanup_orphan_for_runtime, drop_workspace, ensure_frp_health_loop, maybe_start_for_runtime,
-    stop_for_runtime, supervisor, sync_managed_runtime_routes,
+    shutdown_all, stop_for_runtime, supervisor, sync_managed_runtime_routes,
 };
 
 #[allow(unused_imports)]
@@ -19,6 +20,7 @@ pub use cloudflare::{
 };
 #[allow(unused_imports)]
 pub use frp::{actions_frp_snippet, mcp_frp_snippet};
+pub(crate) use logs::{new_trace_id, sanitize_log_line};
 #[allow(unused_imports)]
 pub use software::{install_software, list_software, uninstall_software, SoftwareStatus};
 #[allow(unused_imports)]

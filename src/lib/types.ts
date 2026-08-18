@@ -1,4 +1,11 @@
 export type RuntimeState = "stopped" | "starting" | "running" | "stopping" | "error";
+export type PublicRuntimeState =
+  | "not-configured"
+  | "public-stopped"
+  | "public-starting"
+  | "public-ready"
+  | "public-degraded"
+  | "public-error";
 
 export const DEFAULT_SERVICE_PORT = 28766;
 export const DEFAULT_ACTIONS_PORT = 8787;
@@ -11,6 +18,7 @@ export interface TunnelConfig {
   frp_profile_id?: string;
   frp_server_port?: number;
   cloudflare_mode: string;
+  mcp_transport_v2?: boolean;
   use_proxy?: boolean;
 }
 
@@ -68,6 +76,8 @@ export interface RuntimeStatus {
   publicMessage: string;
   localEndpoint: string;
   publicEndpoint: string;
+  publicState: PublicRuntimeState;
+  publicError: string | null;
 }
 
 export function actionsConfig(profile: WorkspaceProfile): ActionsConfig {

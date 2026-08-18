@@ -10,6 +10,8 @@ use crate::error::{AppError, AppResult};
 use crate::platform::platform;
 use crate::settings::ProxyConfig;
 
+use super::logs::sanitize_log_line;
+
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Handle to a supervised `cloudflared` child process.
@@ -223,6 +225,30 @@ pub(crate) fn apply_proxy_env(cmd: &mut Command, proxy: &ProxyConfig) {
     }
 }
 
+fn cloudflared_args(port: u16, quick: bool, token: &str) -> Vec<String> {
+    if quick {
+        return vec![
+            "tunnel".into(),
+            "--url".into(),
+            format!("http://127.0.0.1:{port}"),
+        ];
+    }
+
+    vec![
+        "tunnel".into(),
+        "--protocol".into(),
+        "http2".into(),
+        "run".into(),
+        "--token".into(),
+        token.trim().into(),
+    ]
+}
+
+fn named_tunnel_ready_line(line: &str) -> bool {
+    line.to_ascii_lowercase()
+        .contains("registered tunnel connection")
+}
+
 /// Spawn `cloudflared tunnel --url http://127.0.0.1:{port}` (quick) or named `tunnel run --token`.
 pub async fn spawn_cloudflare_tunnel(
     port: u16,
@@ -249,6 +275,10 @@ pub async fn spawn_cloudflare_tunnel(
         }
     }
 
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
     let mut cmd = Command::new(&cloudflared);
     cmd.current_dir(cwd);
     cmd.stdout(std::process::Stdio::piped());
@@ -271,63 +301,77 @@ pub async fn spawn_cloudflare_tunnel(
         apply_proxy_env(&mut cmd, &settings.proxy);
     }
 
-    if quick {
-        cmd.args([
-            "tunnel",
-            "--url",
-            &format!("http://127.0.0.1:{port}"),
-        ]);
-    } else {
-        cmd.args([
-            "tunnel",
-            "run",
-            "--token",
-            cloudflare_token.trim(),
-        ]);
-    }
+    cmd.args(cloudflared_args(port, quick, cloudflare_token));
 
     let mut child = cmd
         .spawn()
         .map_err(|err| AppError::Message(format!("启动 cloudflared 失败: {err}")))?;
     let pid = child.id();
 
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
     let (ready_tx, ready_rx) = oneshot::channel();
     let log_path = log_path.to_path_buf();
     let named_url = named_public_url.trim_end_matches('/').to_string();
     let log_path_for_error = log_path.clone();
 
-    if let Some(stdout) = child.stdout.take() {
-        let stderr = child.stderr.take();
-        tokio::spawn(async move {
-            stream_cloudflare_output(stdout, stderr, &log_path, quick, named_url, ready_tx).await;
-        });
-    } else {
-        let _ = ready_tx.send(QuickTunnelReady {
-            public_url: if quick {
-                None
-            } else {
-                Some(named_public_url.trim_end_matches('/').to_string())
-            },
-            named_ready: !quick,
-        });
-    }
+    let Some(stdout) = child.stdout.take() else {
+        stop_child(child, pid).await?;
+        return Err(AppError::Message(
+            "cloudflared 未提供可读取的输出流，已停止新建进程。".into(),
+        ));
+    };
+    let stderr = child.stderr.take();
+    tokio::spawn(async move {
+        stream_cloudflare_output(stdout, stderr, &log_path, quick, named_url, ready_tx).await;
+    });
 
-    let ready = time::timeout(READY_TIMEOUT, ready_rx)
-        .await
-        .map_err(|_| {
-            AppError::Message(format!(
-                "cloudflared 已启动，但在 {} 秒内没有返回 trycloudflare.com 公网地址。\n\
-                 请检查：1) MCP 服务是否已在本机端口 {port} 运行；2) 设置 → 通用 → 网络代理 是否配置为手动代理（如 http://127.0.0.1:7890）；\
-                 3) 查看日志 {log_hint}",
+    let readiness = match time::timeout(READY_TIMEOUT, ready_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(AppError::Message(
+            "cloudflared 输出流在隧道就绪前意外结束。".into(),
+        )),
+        Err(_) => {
+            let expected = if quick {
+                "trycloudflare.com 公网地址"
+            } else {
+                "Cloudflare Edge 注册确认"
+            };
+            Err(AppError::Message(format!(
+                "cloudflared 已启动，但在 {} 秒内没有返回{expected}。请确认本机端口 {port} 可用、网络代理配置正确，并查看日志：{}",
                 READY_TIMEOUT.as_secs(),
-                log_hint = log_path_for_error.display()
-            ))
-        })?
-        .map_err(|_| AppError::Message("cloudflared 输出流意外结束。".into()))?;
+                log_path_for_error.display()
+            )))
+        }
+    };
+    let ready = match readiness {
+        Ok(ready) => ready,
+        Err(error) => {
+            let exit_status = child
+                .try_wait()
+                .ok()
+                .flatten()
+                .map(|status| format!("，退出状态：{status}"))
+                .unwrap_or_default();
+            let message = format!("{error}{exit_status}");
+            stop_child(child, pid).await?;
+            return Err(AppError::Message(message));
+        }
+    };
+
+    match child.try_wait() {
+        Ok(None) => {}
+        Ok(Some(status)) => {
+            return Err(AppError::Message(format!(
+                "cloudflared 报告隧道就绪后立即退出，退出状态：{status}。请查看日志：{}",
+                log_path_for_error.display()
+            )));
+        }
+        Err(error) => {
+            stop_child(child, pid).await?;
+            return Err(AppError::Message(format!(
+                "无法确认 cloudflared 就绪后的进程状态：{error}"
+            )));
+        }
+    }
 
     let public_url = if quick {
         ready.public_url.ok_or_else(|| {
@@ -359,7 +403,7 @@ async fn stream_cloudflare_output<R, E>(
     log_path: &Path,
     quick: bool,
     named_url: String,
-    ready_tx: oneshot::Sender<QuickTunnelReady>,
+    ready_tx: oneshot::Sender<AppResult<QuickTunnelReady>>,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     E: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -374,31 +418,31 @@ async fn stream_cloudflare_output<R, E>(
         .await
     {
         Ok(file) => file,
-        Err(_) => {
+        Err(error) => {
             if let Some(tx) = ready_tx.take() {
-                let _ = tx.send(QuickTunnelReady {
-                    public_url: if quick { None } else { Some(named_url) },
-                    named_ready: !quick,
-                });
+                let _ = tx.send(Err(AppError::Message(format!(
+                    "无法打开 cloudflared 日志文件 {}：{error}",
+                    log_path.display()
+                ))));
             }
             return;
         }
     };
 
-    let send_ready = |tx: &mut Option<oneshot::Sender<QuickTunnelReady>>,
+    let send_ready = |tx: &mut Option<oneshot::Sender<AppResult<QuickTunnelReady>>>,
                       url: Option<String>,
                       named_ready: bool| {
         if let Some(sender) = tx.take() {
-            let _ = sender.send(QuickTunnelReady {
+            let _ = sender.send(Ok(QuickTunnelReady {
                 public_url: url,
                 named_ready,
-            });
+            }));
         }
     };
 
     let handle_line = |line: &str,
                            public_url: &mut Option<String>,
-                           ready_tx: &mut Option<oneshot::Sender<QuickTunnelReady>>| {
+                           ready_tx: &mut Option<oneshot::Sender<AppResult<QuickTunnelReady>>>| {
         if quick {
             if public_url.is_none() {
                 if let Some(url) = extract_trycloudflare_url(line) {
@@ -407,10 +451,7 @@ async fn stream_cloudflare_output<R, E>(
                 }
             }
         } else {
-            let lowered = line.to_ascii_lowercase();
-            if lowered.contains("registered tunnel connection")
-                || lowered.contains("starting metrics server")
-            {
+            if named_tunnel_ready_line(line) {
                 send_ready(ready_tx, Some(named_url.clone()), true);
             }
         }
@@ -438,16 +479,39 @@ async fn stream_cloudflare_output<R, E>(
                 }
             }
         });
+    } else {
+        drop(stderr_line_tx);
     }
 
     while let Some(line) = line_rx.recv().await {
-        let _ = log.write_all(line.as_bytes()).await;
-        let _ = log.write_all(b"\n").await;
-        let _ = log.flush().await;
+        let sanitized = sanitize_log_line(&line);
+        let write_result = async {
+            log.write_all(sanitized.as_bytes()).await?;
+            log.write_all(b"\n").await?;
+            log.flush().await
+        }
+        .await;
+        if let Err(error) = write_result {
+            if let Some(sender) = ready_tx.take() {
+                let _ = sender.send(Err(AppError::Message(format!(
+                    "写入 cloudflared 日志失败：{error}"
+                ))));
+            }
+            return;
+        }
         handle_line(&line, &mut public_url, &mut ready_tx);
     }
 
-    send_ready(&mut ready_tx, public_url, !quick);
+    if let Some(sender) = ready_tx.take() {
+        let expected = if quick {
+            "trycloudflare.com 公网地址"
+        } else {
+            "registered tunnel connection"
+        };
+        let _ = sender.send(Err(AppError::Message(format!(
+            "cloudflared 输出在出现 {expected} 前结束。"
+        ))));
+    }
 }
 
 pub async fn stop_child(mut child: Child, pid: Option<u32>) -> AppResult<()> {
@@ -462,7 +526,35 @@ pub async fn stop_child(mut child: Child, pid: Option<u32>) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_trycloudflare_url;
+    use std::path::Path;
+
+    use tokio::io::AsyncWriteExt;
+    use tokio::sync::oneshot;
+
+    use super::{
+        cloudflared_args, extract_trycloudflare_url, named_tunnel_ready_line,
+        stream_cloudflare_output, QuickTunnelReady,
+    };
+    use crate::error::AppResult;
+
+    async fn named_readiness(lines: &str, log_path: &Path) -> AppResult<QuickTunnelReady> {
+        let (mut writer, reader) = tokio::io::duplex(2_048);
+        writer.write_all(lines.as_bytes()).await.expect("fake output");
+        writer.shutdown().await.expect("close fake output");
+        let (ready_tx, ready_rx) = oneshot::channel();
+
+        stream_cloudflare_output(
+            reader,
+            None::<tokio::io::Empty>,
+            log_path,
+            false,
+            "https://fixed.example.invalid".into(),
+            ready_tx,
+        )
+        .await;
+
+        ready_rx.await.expect("readiness result")
+    }
 
     #[test]
     fn extracts_trycloudflare_url_from_log_line() {
@@ -477,5 +569,79 @@ mod tests {
     fn ignores_invalid_hosts() {
         let line = "https://bad_host.trycloudflare.com";
         assert!(extract_trycloudflare_url(line).is_none());
+    }
+
+    #[test]
+    fn named_tunnel_command_forces_http2() {
+        let args = cloudflared_args(28_766, false, "token-placeholder");
+
+        assert_eq!(
+            args,
+            [
+                "tunnel",
+                "--protocol",
+                "http2",
+                "run",
+                "--token",
+                "token-placeholder",
+            ]
+        );
+    }
+
+    #[test]
+    fn named_tunnel_requires_registered_connection_for_readiness() {
+        assert!(!named_tunnel_ready_line(
+            "INF Starting metrics server on 127.0.0.1:20241/metrics"
+        ));
+        assert!(named_tunnel_ready_line(
+            "INF Registered tunnel connection connIndex=0 protocol=http2"
+        ));
+    }
+
+    #[tokio::test]
+    async fn metrics_only_output_ends_without_marking_named_tunnel_ready() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let result = named_readiness(
+            "INF Starting metrics server on 127.0.0.1:20241/metrics\n",
+            &temp.path().join("cloudflared.log"),
+        )
+        .await;
+
+        let error = match result {
+            Ok(_) => panic!("metrics output must not mark tunnel ready"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("registered tunnel connection"));
+    }
+
+    #[tokio::test]
+    async fn registered_connection_marks_named_tunnel_ready() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ready = named_readiness(
+            "INF Registered tunnel connection connIndex=0 protocol=http2\n",
+            &temp.path().join("cloudflared.log"),
+        )
+        .await
+        .expect("named readiness");
+
+        assert!(ready.named_ready);
+        assert_eq!(
+            ready.public_url.as_deref(),
+            Some("https://fixed.example.invalid")
+        );
+    }
+
+    #[tokio::test]
+    async fn log_open_failure_is_reported_before_readiness() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let result = named_readiness("", temp.path()).await;
+
+        let error = match result {
+            Ok(_) => panic!("directory cannot be used as a log file"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("无法打开 cloudflared 日志文件"));
     }
 }

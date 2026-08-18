@@ -13,6 +13,7 @@
     frp_profile_id: string;
     frp_server_port: number;
     cloudflare_mode: string;
+    mcp_transport_v2: boolean;
     use_proxy: boolean;
   }
 
@@ -38,6 +39,7 @@
     frp_profile_id: "",
     frp_server_port: 7000,
     cloudflare_mode: "quick",
+    mcp_transport_v2: false,
     use_proxy: true,
   });
   let saving = $state(false);
@@ -71,6 +73,7 @@
       draft.frp_profile_id !== config.frp_profile_id ||
       draft.frp_server_port !== config.frp_server_port ||
       draft.cloudflare_mode !== config.cloudflare_mode ||
+      draft.mcp_transport_v2 !== config.mcp_transport_v2 ||
       draft.use_proxy !== config.use_proxy ||
       tokenPending,
   );
@@ -78,6 +81,7 @@
   const showFrp = $derived(draft.type === "frp");
   const showCloudflare = $derived(draft.type === "cloudflare");
   const showCloudflareToken = $derived(showCloudflare && draft.cloudflare_mode === "named");
+  const showStableMcp = $derived(service === "mcp" && showCloudflareToken);
   const showLegacyFrpToken = $derived(showFrp && !useGlobalProfile);
   const canTest = $derived(draft.type === "frp" || draft.type === "cloudflare");
 
@@ -301,6 +305,19 @@
         {workspaceId}
         secretKey={secretKey}
       />
+    {/if}
+
+    {#if showStableMcp}
+      <label class="flex items-start gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2.5">
+        <input
+          type="checkbox"
+          class="mt-0.5 h-4 w-4"
+          bind:checked={draft.mcp_transport_v2}
+        />
+        <span class="text-xs font-medium text-[var(--color-text-secondary)]">
+          稳定固定域名链路
+        </span>
+      </label>
     {/if}
   {/if}
 

@@ -6,6 +6,11 @@ export interface TunnelStatus {
   state: string;
   publicUrl: string;
   tunnelPid: number | null;
+  providerState: string;
+  lastError: string | null;
+  attempt: number;
+  nextRetryAt: number | null;
+  retryable: boolean;
 }
 
 export async function getFrpSnippet(id: string, service: TunnelService): Promise<string> {

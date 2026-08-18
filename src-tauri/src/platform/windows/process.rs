@@ -145,9 +145,7 @@ fn collect_child_pids(root_pid: u32) -> AppResult<Vec<u32>> {
         TH32CS_SNAPPROCESS,
     };
 
-    let mut pending = vec![root_pid];
-    let mut seen = std::collections::HashSet::from([root_pid]);
-    let mut ordered = Vec::new();
+    let mut processes = Vec::new();
 
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
@@ -163,12 +161,7 @@ fn collect_child_pids(root_pid: u32) -> AppResult<Vec<u32>> {
 
         if Process32FirstW(snapshot, &mut entry).is_ok() {
             loop {
-                let parent = entry.th32ParentProcessID;
-                let pid = entry.th32ProcessID;
-                if pending.contains(&parent) && seen.insert(pid) {
-                    ordered.push(pid);
-                    pending.push(pid);
-                }
+                processes.push((entry.th32ProcessID, entry.th32ParentProcessID));
                 if Process32NextW(snapshot, &mut entry).is_err() {
                     break;
                 }
@@ -177,7 +170,10 @@ fn collect_child_pids(root_pid: u32) -> AppResult<Vec<u32>> {
         let _ = CloseHandle(snapshot);
     }
 
-    Ok(ordered)
+    Ok(crate::platform::process_tree::descendant_pids(
+        root_pid,
+        &processes,
+    ))
 }
 
 fn terminate_pid(pid: u32) -> AppResult<()> {

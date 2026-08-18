@@ -225,6 +225,8 @@ pub fn port_busy_message(port: u16, service_label: &str, pid: u32) -> String {
 mod tests {
     use std::fs;
 
+    use tokio::sync::oneshot;
+
     use super::*;
 
     fn write_bundle(root: &std::path::Path, identifier: &str) -> std::path::PathBuf {
@@ -285,5 +287,26 @@ mod tests {
         fs::write(&other, "test executable").expect("write other executable");
 
         assert!(!is_managed_macos_desktop_executable(&other));
+    }
+
+    #[tokio::test]
+    async fn graceful_listener_shutdown_releases_the_bound_port() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tauri::async_runtime::spawn(async move {
+            let _ = shutdown_rx.await;
+            drop(listener);
+        });
+
+        shutdown_tx.send(()).expect("send shutdown");
+        await_listener_shutdown(Some(handle), address.port()).await;
+
+        let rebound = tokio::net::TcpListener::bind(address)
+            .await
+            .expect("port should be reusable after shutdown");
+        drop(rebound);
     }
 }

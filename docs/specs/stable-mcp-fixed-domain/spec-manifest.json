@@ -1,0 +1,31 @@
+{
+  "layout": "parent-child",
+  "subspecs": [
+    {
+      "id": "fixed-domain-tunnel",
+      "title": "固定域名与隧道生命周期",
+      "fr": ["FR-1", "FR-2", "FR-3", "FR-4"]
+    },
+    {
+      "id": "streamable-http-compliance",
+      "title": "Streamable HTTP 与 OAuth 合规",
+      "fr": ["FR-5", "FR-6", "FR-7"]
+    },
+    {
+      "id": "health-observability",
+      "title": "健康检查与可观测性",
+      "fr": ["FR-8", "FR-9"],
+      "dependsOn": ["fixed-domain-tunnel", "streamable-http-compliance"]
+    },
+    {
+      "id": "windows-migration-validation",
+      "title": "Windows 常驻、迁移与回归验证",
+      "fr": ["FR-10", "FR-11", "FR-12"],
+      "dependsOn": [
+        "fixed-domain-tunnel",
+        "streamable-http-compliance",
+        "health-observability"
+      ]
+    }
+  ]
+}

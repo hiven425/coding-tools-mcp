@@ -1,6 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 
+export type HealthStatus = "pass" | "warn" | "skip" | "fail";
+
 export interface HealthItem {
+  key: string;
+  layer: "config" | "local" | "public" | "oauth" | "handshake";
+  status: HealthStatus;
+  traceId: string;
+  retryable: boolean;
   label: string;
   ok: boolean;
   detail: string;

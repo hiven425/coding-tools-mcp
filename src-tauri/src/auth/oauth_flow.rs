@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
+use axum::http::{
+    header::{AUTHORIZATION, WWW_AUTHENTICATE},
+    HeaderMap, HeaderValue, StatusCode,
+};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
@@ -11,6 +14,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::bearer::constant_time_eq_str;
+use super::oauth::mcp_resource_url;
 
 pub const OAUTH_CODE_TTL_SECONDS: u64 = 300;
 pub const OAUTH_TOKEN_TTL_SECONDS: i64 = 60 * 60 * 24 * 30;
@@ -76,7 +80,7 @@ impl OAuthRuntime {
     pub fn verify_access_token(&self, token: &str, server_url: &str) -> bool {
         let server_url = server_url.trim_end_matches('/');
         let mut validation = Validation::new(Algorithm::HS256);
-        validation.set_audience(&[server_url]);
+        validation.set_audience(&[mcp_resource_url(server_url)]);
         validation.set_issuer(&[server_url]);
         decode::<TokenClaims>(
             token,
@@ -92,20 +96,54 @@ pub fn verify_oauth_bearer_header(
     oauth: &OAuthRuntime,
     server_url: &str,
 ) -> Option<Response> {
+    let metadata_url = format!(
+        "{}/.well-known/oauth-protected-resource",
+        server_url.trim_end_matches('/')
+    );
+    verify_oauth_bearer_header_with_metadata(headers, oauth, server_url, &metadata_url)
+}
+
+pub fn verify_oauth_bearer_header_with_metadata(
+    headers: &HeaderMap,
+    oauth: &OAuthRuntime,
+    server_url: &str,
+    resource_metadata_url: &str,
+) -> Option<Response> {
     let Some(header_value) = headers.get(AUTHORIZATION) else {
-        return Some((StatusCode::UNAUTHORIZED, "Missing Authorization header").into_response());
+        return Some(oauth_unauthorized(
+            "Missing Authorization header",
+            resource_metadata_url,
+        ));
     };
     let Ok(header_str) = header_value.to_str() else {
-        return Some((StatusCode::UNAUTHORIZED, "Invalid Authorization header").into_response());
+        return Some(oauth_unauthorized(
+            "Invalid Authorization header",
+            resource_metadata_url,
+        ));
     };
     let Some(token) = header_str.strip_prefix("Bearer ").map(str::trim) else {
-        return Some((StatusCode::UNAUTHORIZED, "Invalid bearer token").into_response());
+        return Some(oauth_unauthorized(
+            "Invalid bearer token",
+            resource_metadata_url,
+        ));
     };
     if oauth.verify_access_token(token, server_url) {
         None
     } else {
-        Some((StatusCode::UNAUTHORIZED, "Invalid bearer token").into_response())
+        Some(oauth_unauthorized(
+            "Invalid bearer token",
+            resource_metadata_url,
+        ))
     }
+}
+
+fn oauth_unauthorized(message: &'static str, resource_metadata_url: &str) -> Response {
+    let mut response = (StatusCode::UNAUTHORIZED, message).into_response();
+    let challenge = format!("Bearer resource_metadata=\"{resource_metadata_url}\"");
+    if let Ok(value) = HeaderValue::from_str(&challenge) {
+        response.headers_mut().insert(WWW_AUTHENTICATE, value);
+    }
+    response
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,7 +337,13 @@ pub fn token_exchange(
     } else {
         code_data.server_url.trim_end_matches('/').to_string()
     };
-    match create_access_token(&issuer, &oauth.token_secret, OAUTH_TOKEN_TTL_SECONDS) {
+    let resource = mcp_resource_url(&issuer);
+    match create_access_token(
+        &issuer,
+        &resource,
+        &oauth.token_secret,
+        OAUTH_TOKEN_TTL_SECONDS,
+    ) {
         Ok(access_token) => (
             StatusCode::OK,
             axum::Json(json!({
@@ -313,11 +357,16 @@ pub fn token_exchange(
     }
 }
 
-fn create_access_token(server_url: &str, token_secret: &str, ttl: i64) -> Result<String, ()> {
+fn create_access_token(
+    issuer: &str,
+    audience: &str,
+    token_secret: &str,
+    ttl: i64,
+) -> Result<String, ()> {
     let now = unix_now() as i64;
     let claims = TokenClaims {
-        iss: server_url.to_string(),
-        aud: server_url.to_string(),
+        iss: issuer.to_string(),
+        aud: audience.to_string(),
         iat: now,
         exp: now + ttl,
         scope: "mcp".into(),
@@ -503,5 +552,33 @@ mod tests {
         let verifier = "dBjftJeZ4CVP-mB92Kpru-AEJvkQlLgi3ThpmQ45N_Xyo";
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         assert!(verify_pkce(verifier, &challenge));
+    }
+
+    #[test]
+    fn access_token_uses_canonical_origin_as_issuer_and_mcp_url_as_audience() {
+        let oauth = OAuthRuntime::new(
+            "https://fixed.example.invalid".into(),
+            "client-placeholder".into(),
+            None,
+            "password-placeholder".into(),
+            "signing-secret-placeholder".into(),
+        );
+        let token = create_access_token(
+            "https://fixed.example.invalid",
+            "https://fixed.example.invalid/mcp",
+            &oauth.token_secret,
+            60,
+        )
+        .expect("access token");
+        assert!(oauth.verify_access_token(&token, "https://fixed.example.invalid"));
+
+        let wrong_audience = create_access_token(
+            "https://fixed.example.invalid",
+            "https://fixed.example.invalid",
+            &oauth.token_secret,
+            60,
+        )
+        .expect("access token");
+        assert!(!oauth.verify_access_token(&wrong_audience, "https://fixed.example.invalid"));
     }
 }

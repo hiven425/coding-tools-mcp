@@ -29,7 +29,22 @@ jobs:
         run: cargo build
       - name: cargo test
         working-directory: src-tauri
-        run: cargo test
+        run: cargo test --locked
+
+  windows-rust:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: cargo check
+        working-directory: src-tauri
+        run: cargo check --locked
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --locked
 
   frontend:
     runs-on: ubuntu-latest

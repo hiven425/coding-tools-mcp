@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::error::{AppError, AppResult};
+use crate::settings::FixedDomainConfigProvider;
 use crate::workspace::WorkspaceProfile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +42,8 @@ pub fn validate_workspace_resources(
     let candidate_claims = service_claims(candidate);
 
     validate_candidate_ports(&existing_claims, &candidate_claims)?;
-    validate_candidate_subdomains(&existing_claims, &candidate_claims)
+    validate_candidate_subdomains(&existing_claims, &candidate_claims)?;
+    validate_fixed_domain_owner(profiles, candidate)
 }
 
 /// Assign free MCP / Actions ports for a newly created workspace.
@@ -96,7 +99,8 @@ pub fn validate_workspace_resources_update(
     let candidate_claims = service_claims(candidate);
 
     validate_changed_candidate_ports(&existing_claims, &candidate_claims, current, candidate)?;
-    validate_changed_candidate_subdomains(&existing_claims, &candidate_claims, current, candidate)
+    validate_changed_candidate_subdomains(&existing_claims, &candidate_claims, current, candidate)?;
+    validate_changed_fixed_domain_owner(profiles, current, candidate)
 }
 
 pub fn validate_service_start(
@@ -124,7 +128,71 @@ pub fn validate_service_start(
         }
     }
 
+    if service == WorkspaceService::Mcp {
+        validate_fixed_domain_owner(profiles, target)?;
+    }
+
     Ok(())
+}
+
+fn validate_changed_fixed_domain_owner(
+    profiles: &[WorkspaceProfile],
+    current: &WorkspaceProfile,
+    candidate: &WorkspaceProfile,
+) -> AppResult<()> {
+    let current_origin = fixed_domain_origin(current)?;
+    let candidate_origin = fixed_domain_origin(candidate)?;
+    if current_origin == candidate_origin {
+        return Ok(());
+    }
+
+    validate_fixed_domain_owner_with_origin(profiles, candidate, candidate_origin.as_deref())
+}
+
+fn validate_fixed_domain_owner(
+    profiles: &[WorkspaceProfile],
+    candidate: &WorkspaceProfile,
+) -> AppResult<()> {
+    let candidate_origin = fixed_domain_origin(candidate)?;
+    validate_fixed_domain_owner_with_origin(profiles, candidate, candidate_origin.as_deref())
+}
+
+fn validate_fixed_domain_owner_with_origin(
+    profiles: &[WorkspaceProfile],
+    candidate: &WorkspaceProfile,
+    candidate_origin: Option<&str>,
+) -> AppResult<()> {
+    let Some(candidate_origin) = candidate_origin else {
+        return Ok(());
+    };
+
+    for owner in profiles
+        .iter()
+        .filter(|profile| profile.id != candidate.id)
+    {
+        let owner_origin = match fixed_domain_origin(owner) {
+            Ok(origin) => origin,
+            Err(_) => continue,
+        };
+        if owner_origin.as_deref() == Some(candidate_origin) {
+            return Err(fixed_domain_conflict_error(candidate_origin, owner));
+        }
+    }
+
+    Ok(())
+}
+
+fn fixed_domain_origin(profile: &WorkspaceProfile) -> AppResult<Option<String>> {
+    if profile.tunnel.tunnel_type != "cloudflare" || profile.tunnel.cloudflare_mode != "named" {
+        return Ok(None);
+    }
+
+    if !profile.tunnel.mcp_transport_v2 {
+        return Ok(None);
+    }
+    let provider = FixedDomainConfigProvider::new(Path::new(&profile.path));
+    provider.resolve_hostname(Some(&profile.tunnel.public_url))
+        .map(|endpoints| endpoints.map(|value| value.origin().to_string()))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -304,6 +372,8 @@ fn subdomain_conflict_error(target: ServiceClaim<'_>, owner: ServiceClaim<'_>) -
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::{
         assign_free_workspace_ports, validate_service_start, validate_workspace_resources,
         validate_workspace_resources_update, WorkspaceService,
@@ -487,4 +557,46 @@ mod tests {
 
         assert!(validate_workspace_resources(&[first], &second).is_ok());
     }
+
+    #[test]
+    fn rejects_fixed_domain_claimed_by_another_workspace_before_start() {
+        let owner_root = tempfile::tempdir().expect("owner tempdir");
+        let target_root = tempfile::tempdir().expect("target tempdir");
+        let dotenv = "cloudflare_host_name=fixed.example.invalid\ncloudflare_token=token-placeholder\n";
+        fs::write(owner_root.path().join(".env"), dotenv).expect("owner dotenv");
+        fs::write(target_root.path().join(".env"), dotenv).expect("target dotenv");
+
+        let mut owner = profile("owner", 28_765, 8_787);
+        owner.path = owner_root.path().to_string_lossy().into_owned();
+        owner.tunnel.tunnel_type = "cloudflare".into();
+        owner.tunnel.cloudflare_mode = "named".into();
+        owner.tunnel.mcp_transport_v2 = true;
+        owner.tunnel.public_url = "https://fallback-one.example.invalid".into();
+
+        let mut target = profile("target", 28_766, 8_788);
+        target.path = target_root.path().to_string_lossy().into_owned();
+        target.tunnel.tunnel_type = "cloudflare".into();
+        target.tunnel.cloudflare_mode = "named".into();
+        target.tunnel.mcp_transport_v2 = true;
+        target.tunnel.public_url = "https://fallback-two.example.invalid".into();
+
+        let error = validate_service_start(
+            &[owner.clone(), target.clone()],
+            &target.id,
+            WorkspaceService::Mcp,
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("固定域名"));
+        assert!(message.contains(&owner.name));
+        assert!(!message.contains("token-placeholder"));
+    }
+}
+
+fn fixed_domain_conflict_error(origin: &str, owner: &WorkspaceProfile) -> AppError {
+    AppError::Message(format!(
+        "固定域名“{origin}”已被工作区“{}”的 MCP 服务使用，当前工作区不能启动。",
+        owner.name
+    ))
 }

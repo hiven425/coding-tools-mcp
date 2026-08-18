@@ -33,8 +33,18 @@ pub fn ensure_frp_health_loop() {
         loop {
             sleep(FRP_HEALTH_INTERVAL).await;
             let settings = AppSettings::load_or_default();
+            let profiles = match DataStore::read_file(|data| Ok(data.profiles.clone())) {
+                Ok(profiles) => profiles,
+                Err(error) => {
+                    eprintln!("tunnel health loop could not load workspaces: {error}");
+                    continue;
+                }
+            };
             let mut guard = supervisor().lock().await;
             let _ = guard.heal_unhealthy_frpc(&settings).await;
+            let _ = guard
+                .heal_unhealthy_cloudflare(&profiles, &settings)
+                .await;
         }
     });
 }
@@ -72,6 +82,11 @@ pub async fn stop_for_runtime(
 pub async fn drop_workspace(workspace_id: &str) -> AppResult<()> {
     let mut guard = supervisor().lock().await;
     guard.drop_workspace(workspace_id).await
+}
+
+pub async fn shutdown_all() -> AppResult<()> {
+    let settings = AppSettings::load_or_default();
+    supervisor().lock().await.shutdown_all(&settings).await
 }
 
 pub async fn sync_managed_runtime_routes(

@@ -47,6 +47,8 @@ pub(crate) mod windows;
 
 mod open;
 mod paths;
+#[cfg(any(target_os = "windows", test))]
+mod process_tree;
 
 pub use open::{is_allowed_url, open_path_in_file_manager, open_url};
 

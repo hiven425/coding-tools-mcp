@@ -37,6 +37,8 @@ struct RuntimeEntry {
     shutdown: Option<mcp::ShutdownSender>,
     handle: Option<JoinHandle<()>>,
     error_message: Option<String>,
+    public_state: String,
+    public_error: Option<String>,
     started_at: Option<std::time::Instant>,
     missing_port_checks: u8,
 }
@@ -91,9 +93,32 @@ impl RuntimeSupervisor {
         self.refresh(profile, ServiceKind::Actions);
     }
 
+    pub fn set_public_status(
+        &mut self,
+        workspace_id: &str,
+        kind: ServiceKind,
+        state: &str,
+        error: Option<String>,
+    ) {
+        if let Some(entry) = self.entries.get_mut(&(workspace_id.to_string(), kind)) {
+            entry.public_state = state.to_string();
+            entry.public_error = error;
+        }
+    }
+
     pub fn drop_workspace(&mut self, profile: &WorkspaceProfile) {
         self.sync_stop_and_wait(profile, ServiceKind::Mcp);
         self.sync_stop_and_wait(profile, ServiceKind::Actions);
+    }
+
+    pub fn shutdown_all(&mut self, profiles: &[WorkspaceProfile]) {
+        for profile in profiles {
+            for kind in [ServiceKind::Mcp, ServiceKind::Actions] {
+                if self.entries.contains_key(&(profile.id.clone(), kind)) {
+                    self.sync_stop_and_wait(profile, kind);
+                }
+            }
+        }
     }
 
     pub fn active_tunnel_service_keys(&self) -> HashSet<(String, TunnelServiceKind)> {
@@ -136,20 +161,33 @@ impl RuntimeSupervisor {
             .get(&key)
             .map(|entry| entry.phase.clone())
             .unwrap_or(RuntimePhase::Stopped);
+        let (public_state, public_error) = self
+            .entries
+            .get(&key)
+            .map(|entry| (entry.public_state.clone(), entry.public_error.clone()))
+            .unwrap_or_else(|| (initial_public_state(profile, kind).into(), None));
 
         let (local_endpoint, public_endpoint) = endpoints(profile, kind);
         let port = port_for(profile, kind);
         let service_label = service_label(kind);
 
         match phase {
-            RuntimePhase::Running => RuntimeStatusDto {
-                state: "running".into(),
-                pid: None,
-                local_message: format!("{service_label}正在监听 127.0.0.1:{port}"),
-                public_message: public_message_for(profile, kind),
-                local_endpoint,
-                public_endpoint,
-            },
+            RuntimePhase::Running => {
+                let public_message = public_error
+                    .as_ref()
+                    .map(|error| format!("公网隧道不可用：{error}"))
+                    .unwrap_or_else(|| public_message_for(profile, kind));
+                RuntimeStatusDto {
+                    state: "running".into(),
+                    pid: None,
+                    local_message: format!("{service_label}正在监听 127.0.0.1:{port}"),
+                    public_message,
+                    local_endpoint,
+                    public_endpoint,
+                    public_state,
+                    public_error,
+                }
+            }
             RuntimePhase::Starting => RuntimeStatusDto {
                 state: "starting".into(),
                 pid: None,
@@ -157,6 +195,8 @@ impl RuntimeSupervisor {
                 public_message: "等待服务就绪".into(),
                 local_endpoint,
                 public_endpoint,
+                public_state,
+                public_error,
             },
             RuntimePhase::Stopping => RuntimeStatusDto {
                 state: "stopping".into(),
@@ -165,6 +205,8 @@ impl RuntimeSupervisor {
                 public_message: "正在停止".into(),
                 local_endpoint,
                 public_endpoint,
+                public_state,
+                public_error,
             },
             RuntimePhase::Error => {
                 let message = self
@@ -179,6 +221,8 @@ impl RuntimeSupervisor {
                     public_message: message,
                     local_endpoint,
                     public_endpoint,
+                    public_state,
+                    public_error,
                 }
             }
             RuntimePhase::Stopped => RuntimeStatusDto {
@@ -188,6 +232,8 @@ impl RuntimeSupervisor {
                 public_message: "未知".into(),
                 local_endpoint,
                 public_endpoint,
+                public_state,
+                public_error,
             },
         }
     }
@@ -221,6 +267,8 @@ impl RuntimeSupervisor {
                 shutdown: None,
                 handle: None,
                 error_message: None,
+                public_state: initial_public_state(profile, kind).into(),
+                public_error: None,
                 started_at: Some(std::time::Instant::now()),
                 missing_port_checks: 0,
             },
@@ -269,6 +317,9 @@ impl RuntimeSupervisor {
                 } else {
                     None
                 };
+                let transport_v2 = profile.tunnel.tunnel_type == "cloudflare"
+                    && profile.tunnel.cloudflare_mode == "named"
+                    && profile.tunnel.mcp_transport_v2;
                 mcp::spawn_listener(
                     port,
                     PathBuf::from(&profile.path),
@@ -279,6 +330,7 @@ impl RuntimeSupervisor {
                     oauth_password,
                     oauth_token_secret,
                     profile.runtime.clone(),
+                    transport_v2,
                 )
             }
             ServiceKind::Actions => {
@@ -342,11 +394,23 @@ impl RuntimeSupervisor {
 
         match spawn_result {
             Ok((shutdown, handle)) => {
-                let started_at = self
+                let (started_at, public_state, public_error) = self
                     .entries
                     .get(&key)
-                    .and_then(|entry| entry.started_at)
-                    .or_else(|| Some(std::time::Instant::now()));
+                    .map(|entry| {
+                        (
+                            entry.started_at,
+                            entry.public_state.clone(),
+                            entry.public_error.clone(),
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            Some(std::time::Instant::now()),
+                            initial_public_state(profile, kind).into(),
+                            None,
+                        )
+                    });
                 self.entries.insert(
                     key,
                     RuntimeEntry {
@@ -354,6 +418,8 @@ impl RuntimeSupervisor {
                         shutdown: Some(shutdown),
                         handle: Some(handle),
                         error_message: None,
+                        public_state,
+                        public_error,
                         started_at,
                         missing_port_checks: 0,
                     },
@@ -376,6 +442,8 @@ impl RuntimeSupervisor {
                         shutdown: None,
                         handle: None,
                         error_message: Some(err.to_string()),
+                        public_state: "public-stopped".into(),
+                        public_error: None,
                         started_at: None,
                         missing_port_checks: 0,
                     },
@@ -465,7 +533,9 @@ impl RuntimeSupervisor {
                         )
                     };
                     entry.phase = RuntimePhase::Error;
-                    entry.error_message = Some(message);
+                    entry.error_message = Some(message.clone());
+                    entry.public_state = "public-degraded".into();
+                    entry.public_error = Some(message);
                     entry.started_at = None;
                     should_cleanup_tunnel = true;
                 }
@@ -539,6 +609,18 @@ fn public_message_for(profile: &WorkspaceProfile, kind: ServiceKind) -> String {
     }
 }
 
+fn initial_public_state(profile: &WorkspaceProfile, kind: ServiceKind) -> &'static str {
+    let tunnel_type = match kind {
+        ServiceKind::Mcp => profile.tunnel.tunnel_type.as_str(),
+        ServiceKind::Actions => profile.actions.tunnel_type.as_str(),
+    };
+    if tunnel_type.is_empty() || tunnel_type == "none" {
+        "not-configured"
+    } else {
+        "public-starting"
+    }
+}
+
 fn service_label(kind: ServiceKind) -> &'static str {
     match kind {
         ServiceKind::Mcp => "本地 MCP ",
@@ -579,6 +661,8 @@ mod tests {
             shutdown: None,
             handle: None,
             error_message: None,
+            public_state: "public-starting".into(),
+            public_error: None,
             started_at,
             missing_port_checks: 0,
         }
@@ -616,5 +700,41 @@ mod tests {
         assert!(!should_mark_runtime_error(&mut runtime, false));
         assert!(!should_mark_runtime_error(&mut runtime, true));
         assert!(!should_mark_runtime_error(&mut runtime, false));
+    }
+
+    #[test]
+    fn public_failure_does_not_mark_a_running_listener_as_failed() {
+        let profile = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
+        let key = (profile.id.clone(), ServiceKind::Mcp);
+        let mut supervisor = RuntimeSupervisor::default();
+        supervisor.entries.insert(
+            key,
+            entry(RuntimePhase::Running, Some(std::time::Instant::now())),
+        );
+
+        supervisor.set_public_status(
+            &profile.id,
+            ServiceKind::Mcp,
+            "public-error",
+            Some("edge registration failed".into()),
+        );
+
+        let status = supervisor.mcp_status(&profile);
+        assert_eq!(status.state, "running");
+        assert_eq!(status.public_state, "public-error");
+        assert_eq!(status.public_error.as_deref(), Some("edge registration failed"));
+    }
+
+    #[test]
+    fn stopped_runtime_without_tunnel_reports_not_configured() {
+        let mut profile = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
+        profile.tunnel.tunnel_type = "none".into();
+        let supervisor = RuntimeSupervisor::default();
+
+        let status = supervisor.mcp_status(&profile);
+
+        assert_eq!(status.state, "stopped");
+        assert_eq!(status.public_state, "not-configured");
+        assert!(status.public_error.is_none());
     }
 }

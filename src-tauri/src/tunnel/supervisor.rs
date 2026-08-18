@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::process::Child;
 use tokio::time::{sleep, Duration, Instant};
@@ -7,11 +8,13 @@ use tokio::time::{sleep, Duration, Instant};
 use crate::error::{AppError, AppResult};
 use crate::platform::platform;
 use crate::secret::SecretStore;
-use crate::settings::AppSettings;
+use crate::settings::{AppSettings, FixedDomainConfigProvider};
 use crate::workspace::WorkspaceProfile;
 
 use super::cloudflare::{self, CloudflareTunnelHandle};
 use super::frp::{self, FrpServerConfig};
+pub use super::logs::{append_profile_log, log_dir_for_profile};
+use super::logs::new_trace_id;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TunnelServiceKind {
@@ -37,12 +40,35 @@ pub struct TunnelStatus {
     pub state: String,
     pub public_url: String,
     pub tunnel_pid: Option<u32>,
+    pub provider_state: String,
+    pub last_error: Option<String>,
+    pub attempt: u8,
+    pub next_retry_at: Option<u64>,
+    pub retryable: bool,
 }
 
 struct TunnelSession {
     public_url: String,
     pid: Option<u32>,
     child: Option<Child>,
+    provider_state: String,
+    last_error: Option<String>,
+    attempt: u8,
+    next_retry_at: Option<SystemTime>,
+}
+
+impl TunnelSession {
+    fn ready(public_url: String, pid: Option<u32>, child: Option<Child>) -> Self {
+        Self {
+            public_url,
+            pid,
+            child,
+            provider_state: "public-ready".into(),
+            last_error: None,
+            attempt: 0,
+            next_retry_at: None,
+        }
+    }
 }
 
 struct FrpRoute {
@@ -66,6 +92,7 @@ pub struct TunnelSupervisor {
     frp_routes: HashMap<(String, TunnelServiceKind), FrpRoute>,
     frpc: HashMap<String, FrpcProcess>,
     frpc_health: HashMap<String, FrpcHealthState>,
+    active_runtime_keys: HashSet<(String, TunnelServiceKind)>,
 }
 
 impl Default for TunnelSupervisor {
@@ -76,6 +103,8 @@ impl Default for TunnelSupervisor {
 
 const FRPC_HEALTH_STREAK_TO_RESTART: u32 = 2;
 const FRPC_HEALTH_RESTART_COOLDOWN: Duration = Duration::from_secs(90);
+const CLOUDFLARE_RECOVERY_MAX_ATTEMPTS: u8 = 5;
+const CLOUDFLARE_RECOVERY_COOLDOWN: Duration = Duration::from_secs(90);
 
 #[allow(dead_code)]
 impl TunnelSupervisor {
@@ -85,6 +114,7 @@ impl TunnelSupervisor {
             frp_routes: HashMap::new(),
             frpc: HashMap::new(),
             frpc_health: HashMap::new(),
+            active_runtime_keys: HashSet::new(),
         }
     }
 
@@ -222,20 +252,38 @@ impl TunnelSupervisor {
         settings: &AppSettings,
     ) -> TunnelStatus {
         let key = (profile.id.clone(), kind);
-        if self.session_is_running(&key) {
-            if let Some(session) = self.sessions.get(&key) {
-                return TunnelStatus {
-                    state: "running".into(),
-                    public_url: session.public_url.clone(),
-                    tunnel_pid: session.pid,
-                };
-            }
+        if let Some(session) = self.sessions.get(&key) {
+            let running = self.session_is_running(&key);
+            let state = if running {
+                "running"
+            } else if session.provider_state == "public-recovering" {
+                "starting"
+            } else if session.provider_state == "public-error" {
+                "error"
+            } else {
+                "degraded"
+            };
+            return TunnelStatus {
+                state: state.into(),
+                public_url: session.public_url.clone(),
+                tunnel_pid: session.pid,
+                provider_state: session.provider_state.clone(),
+                last_error: session.last_error.clone(),
+                attempt: session.attempt,
+                next_retry_at: session.next_retry_at.and_then(system_time_millis),
+                retryable: session.attempt < CLOUDFLARE_RECOVERY_MAX_ATTEMPTS,
+            };
         }
 
         TunnelStatus {
             state: "stopped".into(),
             public_url: public_url_for_profile(profile, kind, settings),
             tunnel_pid: None,
+            provider_state: "public-stopped".into(),
+            last_error: None,
+            attempt: 0,
+            next_retry_at: None,
+            retryable: false,
         }
     }
 
@@ -272,9 +320,27 @@ impl TunnelSupervisor {
         kind: TunnelServiceKind,
         settings: &AppSettings,
     ) -> AppResult<TunnelStatus> {
+        let trace_id = new_trace_id();
+        let started_at = Instant::now();
         let key = (profile.id.clone(), kind);
         let tunnel_type = tunnel_type_for(profile, kind);
+        append_profile_log(
+            &profile.id,
+            "tunnel-lifecycle.log",
+            &format!(
+                "[trace={trace_id}] stage=public-starting service={} provider={tunnel_type}",
+                tunnel_service_label(kind)
+            ),
+        );
         if self.session_is_running(&key) && tunnel_type != "frp" {
+            append_profile_log(
+                &profile.id,
+                "tunnel-lifecycle.log",
+                &format!(
+                    "[trace={trace_id}] stage=public-ready reused=true elapsed_ms={}",
+                    started_at.elapsed().as_millis()
+                ),
+            );
             return Ok(self.status(profile, kind, settings));
         }
 
@@ -322,16 +388,17 @@ impl TunnelSupervisor {
             let pid = self.frpc.get(&profile.id).and_then(|process| process.pid);
             self.sessions.insert(
                 key,
-                TunnelSession {
-                    public_url: public_url.clone(),
-                    pid,
-                    child: None,
-                },
+                TunnelSession::ready(public_url.clone(), pid, None),
             );
             return Ok(TunnelStatus {
                 state: "running".into(),
                 public_url,
                 tunnel_pid: pid,
+                provider_state: "public-ready".into(),
+                last_error: None,
+                attempt: 0,
+                next_retry_at: None,
+                retryable: true,
             });
         }
 
@@ -349,7 +416,7 @@ impl TunnelSupervisor {
         };
         let use_proxy = tunnel_use_proxy(profile, kind);
         let log_path = log_dir_for_profile(&profile.id).join(log_name);
-        let handle = cloudflare::spawn_cloudflare_tunnel(
+        let handle = match cloudflare::spawn_cloudflare_tunnel(
             port,
             std::path::Path::new(&profile.path),
             &log_path,
@@ -359,9 +426,32 @@ impl TunnelSupervisor {
             use_proxy,
         )
         .await
-        .inspect_err(|_| {
-            self.restore_route_state(&key, previous_route.take(), previous_session.take());
-        })?;
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                let had_previous_session = previous_session.is_some();
+                self.restore_route_state(&key, previous_route.take(), previous_session.take());
+                if !had_previous_session {
+                    let mut session = TunnelSession::ready(named_url, None, None);
+                    record_cloudflare_recovery_failure(
+                        &mut session,
+                        error.to_string(),
+                        SystemTime::now(),
+                        recovery_jitter(),
+                    );
+                    self.sessions.insert(key, session);
+                }
+                append_profile_log(
+                    &profile.id,
+                    "tunnel-lifecycle.log",
+                    &format!(
+                        "[trace={trace_id}] stage=public-error elapsed_ms={} error={error}",
+                        started_at.elapsed().as_millis()
+                    ),
+                );
+                return Err(error);
+            }
+        };
 
         let CloudflareTunnelHandle {
             child,
@@ -371,17 +461,26 @@ impl TunnelSupervisor {
 
         self.sessions.insert(
             key,
-            TunnelSession {
-                public_url: public_url.clone(),
-                pid,
-                child: Some(child),
-            },
+            TunnelSession::ready(public_url.clone(), pid, Some(child)),
+        );
+        append_profile_log(
+            &profile.id,
+            "tunnel-lifecycle.log",
+            &format!(
+                "[trace={trace_id}] stage=public-ready elapsed_ms={}",
+                started_at.elapsed().as_millis()
+            ),
         );
 
         Ok(TunnelStatus {
             state: "running".into(),
             public_url,
             tunnel_pid: pid,
+            provider_state: "public-ready".into(),
+            last_error: None,
+            attempt: 0,
+            next_retry_at: None,
+            retryable: true,
         })
     }
 
@@ -533,6 +632,7 @@ impl TunnelSupervisor {
         active_runtime_keys: &HashSet<(String, TunnelServiceKind)>,
         settings: &AppSettings,
     ) {
+        self.active_runtime_keys = active_runtime_keys.clone();
         let mut changed_workspaces = HashSet::new();
         for profile in profiles {
             for kind in [TunnelServiceKind::Mcp, TunnelServiceKind::Actions] {
@@ -750,11 +850,7 @@ impl TunnelSupervisor {
                 None => {
                     self.sessions.insert(
                         key.clone(),
-                        TunnelSession {
-                            public_url,
-                            pid,
-                            child: None,
-                        },
+                        TunnelSession::ready(public_url, pid, None),
                     );
                 }
             }
@@ -791,6 +887,115 @@ impl TunnelSupervisor {
             && tunnel_use_proxy(&route.profile, route.kind) == tunnel_use_proxy(profile, kind)
     }
 
+    pub async fn heal_unhealthy_cloudflare(
+        &mut self,
+        profiles: &[WorkspaceProfile],
+        settings: &AppSettings,
+    ) -> AppResult<()> {
+        let now = SystemTime::now();
+        let active_keys: Vec<_> = self.active_runtime_keys.iter().cloned().collect();
+        let mut candidates = Vec::new();
+
+        for key in active_keys {
+            let Some(profile) = profiles.iter().find(|profile| profile.id == key.0) else {
+                continue;
+            };
+            let stable_mcp_enabled = key.1 == TunnelServiceKind::Mcp
+                && profile.tunnel.cloudflare_mode == "named"
+                && profile.tunnel.mcp_transport_v2;
+            if !stable_mcp_enabled
+                || tunnel_type_for(profile, key.1) != "cloudflare"
+                || self.cloudflare_session_is_alive(&key)
+            {
+                continue;
+            }
+            let retry_due = self.sessions.get(&key).is_some_and(|session| {
+                session.attempt < CLOUDFLARE_RECOVERY_MAX_ATTEMPTS
+                    && session
+                        .next_retry_at
+                        .map(|next| next <= now)
+                        .unwrap_or(true)
+            });
+            if retry_due {
+                candidates.push((profile.clone(), key.1));
+            }
+        }
+
+        for (profile, kind) in candidates {
+            let trace_id = new_trace_id();
+            let started_at = Instant::now();
+            let key = (profile.id.clone(), kind);
+            if let Some(session) = self.sessions.get_mut(&key) {
+                session.provider_state = "public-recovering".into();
+            }
+            if let Err(error) = self.start(&profile, kind, settings).await {
+                if let Some(session) = self.sessions.get_mut(&key) {
+                    record_cloudflare_recovery_failure(
+                        session,
+                        error.to_string(),
+                        SystemTime::now(),
+                        recovery_jitter(),
+                    );
+                    append_profile_log(
+                        &profile.id,
+                        "cloudflared.log",
+                        &format!(
+                            "[trace={trace_id}] stage=public-recovering elapsed_ms={} attempt={} error={}",
+                            started_at.elapsed().as_millis(),
+                            session.attempt,
+                            session.last_error.as_deref().unwrap_or("未知错误")
+                        ),
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn shutdown_all(&mut self, settings: &AppSettings) -> AppResult<()> {
+        let keys: HashSet<_> = self
+            .sessions
+            .keys()
+            .chain(self.frp_routes.keys())
+            .cloned()
+            .collect();
+        let mut first_error = None;
+        for (workspace_id, kind) in keys {
+            if let Err(error) = self.stop_internal(&workspace_id, kind, settings).await {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        self.active_runtime_keys.clear();
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn cloudflare_session_is_alive(&mut self, key: &(String, TunnelServiceKind)) -> bool {
+        let Some(session) = self.sessions.get_mut(key) else {
+            return false;
+        };
+        if let Some(child) = session.child.as_mut() {
+            match child.try_wait() {
+                Ok(None) => return true,
+                Ok(Some(_)) => {
+                    session.pid = None;
+                    return false;
+                }
+                Err(_) => {}
+            }
+        }
+        session
+            .pid
+            .map(|pid| platform().is_process_alive(pid))
+            .unwrap_or(false)
+    }
+
     fn session_is_running(&self, key: &(String, TunnelServiceKind)) -> bool {
         if self.frp_routes.contains_key(key) {
             let process_alive = self.frpc.get(&key.0).is_some_and(|process| {
@@ -808,6 +1013,48 @@ impl TunnelSupervisor {
                 .unwrap_or(false)
         })
     }
+}
+
+fn record_cloudflare_recovery_failure(
+    session: &mut TunnelSession,
+    error: String,
+    now: SystemTime,
+    jitter: Duration,
+) {
+    session.attempt = session.attempt.saturating_add(1);
+    if session.attempt >= CLOUDFLARE_RECOVERY_MAX_ATTEMPTS {
+        session.provider_state = "public-error".into();
+        session.last_error = Some(format!(
+            "{error}；自动恢复已达到 {} 次上限，请检查 cloudflared 日志和网络后手动重试",
+            CLOUDFLARE_RECOVERY_MAX_ATTEMPTS
+        ));
+        session.next_retry_at = now.checked_add(CLOUDFLARE_RECOVERY_COOLDOWN);
+        return;
+    }
+
+    session.provider_state = "public-degraded".into();
+    session.last_error = Some(error);
+    session.next_retry_at = now.checked_add(recovery_delay(session.attempt, jitter));
+}
+
+fn recovery_delay(attempt: u8, jitter: Duration) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(4) as u32;
+    Duration::from_secs(2_u64.pow(exponent)) + jitter
+}
+
+fn recovery_jitter() -> Duration {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::from(duration.subsec_millis()) % 250)
+        .unwrap_or(0);
+    Duration::from_millis(millis)
+}
+
+fn system_time_millis(value: SystemTime) -> Option<u64> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
 }
 
 fn proxy_already_exists(error: &AppError) -> bool {
@@ -888,22 +1135,7 @@ fn validate_tunnel_requirements(
 
     cloudflare::resolve_cloudflared()?;
 
-    let (mode, token, named_url) = match kind {
-        TunnelServiceKind::Mcp => (
-            profile.tunnel.cloudflare_mode.as_str(),
-            SecretStore::get(&profile.id, "cloudflare_token")?.unwrap_or_default(),
-            profile.tunnel.public_url.clone(),
-        ),
-        TunnelServiceKind::Actions => (
-            profile.actions.cloudflare_mode.as_str(),
-            if profile.actions.cloudflare_token.trim().is_empty() {
-                SecretStore::get(&profile.id, "actions_cloudflare_token")?.unwrap_or_default()
-            } else {
-                profile.actions.cloudflare_token.clone()
-            },
-            profile.actions.public_url.clone(),
-        ),
-    };
+    let (_, mode, token, named_url, _) = cloudflare_config(profile, kind)?;
 
     if mode == "named" {
         if token.trim().is_empty() {
@@ -934,11 +1166,27 @@ fn cloudflare_config(
 ) -> AppResult<(u16, &str, String, String, &'static str)> {
     match kind {
         TunnelServiceKind::Mcp => {
-            let token = SecretStore::get(&profile.id, "cloudflare_token")?.unwrap_or_default();
+            let mode = profile.tunnel.cloudflare_mode.as_str();
+            let fallback_token =
+                SecretStore::get(&profile.id, "cloudflare_token")?.unwrap_or_default();
+            let provider = FixedDomainConfigProvider::new(Path::new(&profile.path));
+            if mode == "named" && profile.tunnel.mcp_transport_v2 {
+                let config = provider.resolve(
+                    Some(&profile.tunnel.public_url),
+                    Some(&fallback_token),
+                )?;
+                return Ok((
+                    profile.runtime.local_port,
+                    mode,
+                    config.token().to_string(),
+                    config.endpoints.origin().to_string(),
+                    "cloudflared.log",
+                ));
+            }
             Ok((
                 profile.runtime.local_port,
-                profile.tunnel.cloudflare_mode.as_str(),
-                token,
+                mode,
+                fallback_token,
                 profile.tunnel.public_url.clone(),
                 "cloudflared.log",
             ))
@@ -960,32 +1208,10 @@ fn cloudflare_config(
     }
 }
 
-pub fn log_dir_for_profile(profile_id: &str) -> PathBuf {
-    platform()
-        .app_config_dir()
-        .map(|home| home.join("logs").join(profile_id))
-        .unwrap_or_else(|_| PathBuf::from("logs").join(profile_id))
-}
-
-pub fn append_profile_log(profile_id: &str, file_name: &str, line: &str) {
-    use std::io::Write;
-
-    let log_dir = log_dir_for_profile(profile_id);
-    if std::fs::create_dir_all(&log_dir).is_err() {
-        return;
-    }
-    let path = log_dir.join(file_name);
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "{line}");
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     fn frp_profile(name: &str, subdomain: &str) -> WorkspaceProfile {
@@ -1150,11 +1376,7 @@ mod tests {
         );
         supervisor.sessions.insert(
             stale_key,
-            TunnelSession {
-                public_url: "https://old.frp.example.com".into(),
-                pid: Some(1),
-                child: None,
-            },
+            TunnelSession::ready("https://old.frp.example.com".into(), Some(1), None),
         );
 
         supervisor.sync_frp_sessions_for_workspace(&settings, &current_key.0, Some(42));
@@ -1203,5 +1425,111 @@ mod tests {
             supervisor.sessions.get(&second_key).and_then(|s| s.pid),
             Some(99)
         );
+    }
+
+    #[tokio::test]
+    async fn start_reuses_a_healthy_cloudflare_session_after_listener_restart() {
+        let settings = AppSettings::default();
+        let mut profile = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
+        profile.tunnel.tunnel_type = "cloudflare".into();
+        profile.tunnel.cloudflare_mode = "named".into();
+        profile.tunnel.public_url = "https://fixed.example.invalid".into();
+        let key = (profile.id.clone(), TunnelServiceKind::Mcp);
+        let current_pid = std::process::id();
+        let mut supervisor = TunnelSupervisor::new();
+        supervisor.sessions.insert(
+            key.clone(),
+            TunnelSession::ready(
+                profile.tunnel.public_url.clone(),
+                Some(current_pid),
+                None,
+            ),
+        );
+
+        let status = supervisor
+            .start(&profile, TunnelServiceKind::Mcp, &settings)
+            .await
+            .expect("reuse cloudflare session");
+
+        assert_eq!(status.tunnel_pid, Some(current_pid));
+        assert_eq!(status.public_url, "https://fixed.example.invalid");
+        assert_eq!(supervisor.sessions.get(&key).and_then(|item| item.pid), Some(current_pid));
+    }
+
+    #[test]
+    fn cloudflare_recovery_uses_bounded_exponential_backoff() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut session = TunnelSession::ready(
+            "https://fixed.example.invalid".into(),
+            None,
+            None,
+        );
+
+        for expected_delay in [1, 2, 4, 8] {
+            record_cloudflare_recovery_failure(
+                &mut session,
+                "temporary edge failure".into(),
+                now,
+                Duration::ZERO,
+            );
+            assert_eq!(session.provider_state, "public-degraded");
+            assert_eq!(
+                session
+                    .next_retry_at
+                    .expect("next retry")
+                    .duration_since(now)
+                    .expect("future retry"),
+                Duration::from_secs(expected_delay)
+            );
+        }
+
+        record_cloudflare_recovery_failure(
+            &mut session,
+            "final edge failure".into(),
+            now,
+            Duration::ZERO,
+        );
+        assert_eq!(session.attempt, CLOUDFLARE_RECOVERY_MAX_ATTEMPTS);
+        assert_eq!(session.provider_state, "public-error");
+        assert!(session
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("手动重试")));
+        assert_eq!(
+            session
+                .next_retry_at
+                .expect("cooldown")
+                .duration_since(now)
+                .expect("future cooldown"),
+            CLOUDFLARE_RECOVERY_COOLDOWN
+        );
+    }
+
+    #[test]
+    fn transport_flag_switches_between_legacy_and_fixed_domain_named_config() {
+        let root = tempfile::tempdir().expect("workspace tempdir");
+        let mut profile = WorkspaceProfile::new(
+            root.path().to_string_lossy().into_owned(),
+            Some("demo".into()),
+        );
+        profile.tunnel.tunnel_type = "cloudflare".into();
+        profile.tunnel.cloudflare_mode = "named".into();
+        profile.tunnel.public_url = "https://legacy.example.invalid".into();
+        fs::write(
+            root.path().join(".env"),
+            "cloudflare_host_name=fixed.example.invalid\ncloudflare_token=token-placeholder\n",
+        )
+        .expect("write legacy flag");
+
+        let (_, _, legacy_token, legacy_url, _) =
+            cloudflare_config(&profile, TunnelServiceKind::Mcp).expect("legacy config");
+        assert_eq!(legacy_url, "https://legacy.example.invalid");
+        assert_ne!(legacy_token, "token-placeholder");
+
+        profile.tunnel.mcp_transport_v2 = true;
+        let (_, _, fixed_token, fixed_url, _) =
+            cloudflare_config(&profile, TunnelServiceKind::Mcp).expect("fixed-domain config");
+        assert_eq!(fixed_url, "https://fixed.example.invalid");
+        assert_eq!(fixed_token, "token-placeholder");
     }
 }

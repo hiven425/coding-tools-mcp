@@ -905,11 +905,7 @@ impl TunnelSupervisor {
             let Some(profile) = profiles.iter().find(|profile| profile.id == key.0) else {
                 continue;
             };
-            let stable_mcp_enabled = key.1 == TunnelServiceKind::Mcp
-                && profile.tunnel.cloudflare_mode == "named"
-                && profile.tunnel.mcp_transport_v2;
-            if !stable_mcp_enabled
-                || tunnel_type_for(profile, key.1) != "cloudflare"
+            if !named_cloudflare_recovery_enabled(profile, key.1)
                 || self.cloudflare_session_is_alive(&key)
             {
                 continue;
@@ -1071,6 +1067,16 @@ fn tunnel_type_for(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> &str 
     match kind {
         TunnelServiceKind::Mcp => profile.tunnel.tunnel_type.as_str(),
         TunnelServiceKind::Actions => profile.actions.tunnel_type.as_str(),
+    }
+}
+
+fn named_cloudflare_recovery_enabled(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> bool {
+    if tunnel_type_for(profile, kind) != "cloudflare" {
+        return false;
+    }
+    match kind {
+        TunnelServiceKind::Mcp => profile.tunnel.cloudflare_mode == "named",
+        TunnelServiceKind::Actions => profile.actions.cloudflare_mode == "named",
     }
 }
 
@@ -1508,6 +1514,36 @@ mod tests {
                 .expect("future cooldown"),
             CLOUDFLARE_RECOVERY_COOLDOWN
         );
+    }
+
+    #[test]
+    fn named_cloudflare_recovery_includes_legacy_mcp_and_actions() {
+        let mut profile = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
+        profile.tunnel.tunnel_type = "cloudflare".into();
+        profile.tunnel.cloudflare_mode = "named".into();
+        profile.tunnel.mcp_transport_v2 = false;
+        profile.actions.tunnel_type = "cloudflare".into();
+        profile.actions.cloudflare_mode = "named".into();
+
+        assert!(named_cloudflare_recovery_enabled(
+            &profile,
+            TunnelServiceKind::Mcp
+        ));
+        assert!(named_cloudflare_recovery_enabled(
+            &profile,
+            TunnelServiceKind::Actions
+        ));
+
+        profile.tunnel.cloudflare_mode = "quick".into();
+        profile.actions.tunnel_type = "frp".into();
+        assert!(!named_cloudflare_recovery_enabled(
+            &profile,
+            TunnelServiceKind::Mcp
+        ));
+        assert!(!named_cloudflare_recovery_enabled(
+            &profile,
+            TunnelServiceKind::Actions
+        ));
     }
 
     #[test]

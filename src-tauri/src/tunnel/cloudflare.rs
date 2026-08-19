@@ -1,3 +1,4 @@
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -10,10 +11,13 @@ use crate::error::{AppError, AppResult};
 use crate::platform::platform;
 use crate::settings::ProxyConfig;
 
-use super::logs::sanitize_log_line;
+use super::logs::{
+    format_cloudflared_log_line, sanitize_log_line, timestamped_log_line,
+};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
+const DIAGNOSTIC_LOG_TAIL_BYTES: u64 = 16 * 1024;
 
 /// Handle to a supervised `cloudflared` child process.
 pub struct CloudflareTunnelHandle {
@@ -98,7 +102,7 @@ fn cloudflared_release_asset() -> AppResult<&'static str> {
 }
 
 /// Latest cloudflared release. Pinned for reproducibility; bump as needed.
-const CLOUDFLARED_VERSION: &str = "2025.6.1";
+const CLOUDFLARED_VERSION: &str = "2026.8.2";
 
 /// Download cloudflared into the app cache `bin/` directory, honoring the
 /// configured mirror + proxy. Windows/Linux assets are raw binaries; macOS
@@ -250,6 +254,93 @@ fn named_tunnel_ready_line(line: &str) -> bool {
         .contains("registered tunnel connection")
 }
 
+fn safe_proxy_endpoint(value: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return "<configured-unparseable>".into();
+    };
+    let Some(host) = url.host_str() else {
+        return "<configured-unparseable>".into();
+    };
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    }
+}
+
+fn configured_proxy_description(use_proxy: bool, proxy: &ProxyConfig) -> String {
+    if !use_proxy {
+        return "disabled".into();
+    }
+    let description = match proxy.mode.as_str() {
+        "manual" if !proxy.url.trim().is_empty() => {
+            format!("manual({})", safe_proxy_endpoint(proxy.url.trim()))
+        }
+        "system" => std::env::var("HTTPS_PROXY")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var("HTTP_PROXY").ok().filter(|value| !value.is_empty()))
+            .or_else(|| std::env::var("ALL_PROXY").ok().filter(|value| !value.is_empty()))
+            .map(|value| format!("system({})", safe_proxy_endpoint(&value)))
+            .unwrap_or_else(|| "system(unresolved)".into()),
+        mode => format!("{mode}(unresolved)"),
+    };
+    sanitize_log_line(&description)
+}
+
+fn append_cloudflared_diagnostic(log_path: &Path, line: &str) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let _ = writeln!(file, "{}", timestamped_log_line(line));
+    }
+}
+
+fn recent_cloudflared_error(log_path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(log_path).ok()?;
+    let size = file.seek(SeekFrom::End(0)).ok()?;
+    file.seek(SeekFrom::Start(size.saturating_sub(DIAGNOSTIC_LOG_TAIL_BYTES)))
+        .ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    let tail = String::from_utf8_lossy(&tail);
+    tail.lines()
+        .rev()
+        .find(|line| line.contains(" ERR ") || line.starts_with("ERR "))
+        .map(sanitize_log_line)
+}
+
+fn readiness_timeout_message(
+    quick: bool,
+    port: u16,
+    proxy: &str,
+    recent_error: Option<&str>,
+    log_path: &Path,
+) -> String {
+    let expected = if quick {
+        "trycloudflare.com 公网地址"
+    } else {
+        "Cloudflare Edge 注册确认"
+    };
+    let transport = if quick {
+        "auto(QUIC/UDP 7844，失败后回退 HTTP/2/TCP 7844)"
+    } else {
+        "http2/TCP 7844"
+    };
+    let recent_error = recent_error.unwrap_or("未捕获到 cloudflared ERR 行");
+    format!(
+        "cloudflared 已启动，但在 {} 秒内没有返回{expected}。诊断：failure_boundary=cloudflared->Cloudflare Edge；edge_transport={transport}；configured_proxy={proxy}；proxy_scope=HTTP(S) Origin only；local_origin=http://127.0.0.1:{port}；last_edge_error={recent_error}。Cloudflare Edge 隧道链路不会由当前 HTTP 代理变量转发；若最近错误包含 dial tcp <edge-ip>:7844 i/o timeout，请在本机防火墙、路由器或代理软件中放行 Cloudflare Tunnel 的 TCP 7844 出站连接。该错误不表示本地端口 {port} 不可用。日志：{}",
+        READY_TIMEOUT.as_secs(),
+        log_path.display()
+    )
+}
+
 /// Spawn `cloudflared tunnel --url http://127.0.0.1:{port}` (quick) or named `tunnel run --token`.
 pub async fn spawn_cloudflare_tunnel(
     port: u16,
@@ -298,11 +389,26 @@ pub async fn spawn_cloudflare_tunnel(
     }
 
     let settings = crate::settings::AppSettings::load_or_default();
+    let proxy_description = configured_proxy_description(use_proxy, &settings.proxy);
     if use_proxy {
         apply_proxy_env(&mut cmd, &settings.proxy);
     }
 
     cmd.args(cloudflared_args(port, quick, cloudflare_token));
+    append_cloudflared_diagnostic(
+        log_path,
+        &format!(
+            "event=cloudflared-start mode={} edge_transport={} configured_proxy={} proxy_scope=HTTP(S)-origin-only local_origin=http://127.0.0.1:{port} readiness={}",
+            if quick { "quick" } else { "named" },
+            if quick { "auto/7844" } else { "http2/tcp/7844" },
+            proxy_description,
+            if quick {
+                "trycloudflare-url"
+            } else {
+                "registered-tunnel-connection"
+            }
+        ),
+    );
 
     let mut child = cmd
         .spawn()
@@ -331,16 +437,19 @@ pub async fn spawn_cloudflare_tunnel(
             "cloudflared 输出流在隧道就绪前意外结束。".into(),
         )),
         Err(_) => {
-            let expected = if quick {
-                "trycloudflare.com 公网地址"
-            } else {
-                "Cloudflare Edge 注册确认"
-            };
-            Err(AppError::Message(format!(
-                "cloudflared 已启动，但在 {} 秒内没有返回{expected}。请确认本机端口 {port} 可用、网络代理配置正确，并查看日志：{}",
-                READY_TIMEOUT.as_secs(),
-                log_path_for_error.display()
-            )))
+            let recent_error = recent_cloudflared_error(&log_path_for_error);
+            let message = readiness_timeout_message(
+                quick,
+                port,
+                &proxy_description,
+                recent_error.as_deref(),
+                &log_path_for_error,
+            );
+            append_cloudflared_diagnostic(
+                &log_path_for_error,
+                &format!("event=cloudflared-readiness-timeout {message}"),
+            );
+            Err(AppError::Message(message))
         }
     };
     let ready = match readiness {
@@ -485,7 +594,7 @@ async fn stream_cloudflare_output<R, E>(
     }
 
     while let Some(line) = line_rx.recv().await {
-        let sanitized = sanitize_log_line(&line);
+        let sanitized = format_cloudflared_log_line(&line);
         let write_result = async {
             log.write_all(sanitized.as_bytes()).await?;
             log.write_all(b"\n").await?;
@@ -580,10 +689,12 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        cloudflared_args, extract_trycloudflare_url, named_tunnel_ready_line, stop_child,
+        cloudflared_args, configured_proxy_description, extract_trycloudflare_url,
+        named_tunnel_ready_line, readiness_timeout_message, recent_cloudflared_error, stop_child,
         stream_cloudflare_output, QuickTunnelReady,
     };
     use crate::error::AppResult;
+    use crate::settings::ProxyConfig;
 
     async fn named_readiness(lines: &str, log_path: &Path) -> AppResult<QuickTunnelReady> {
         let (mut writer, reader) = tokio::io::duplex(2_048);
@@ -637,6 +748,11 @@ mod tests {
     }
 
     #[test]
+    fn managed_cloudflared_version_includes_connectivity_prechecks() {
+        assert_eq!(super::CLOUDFLARED_VERSION, "2026.8.2");
+    }
+
+    #[test]
     fn named_tunnel_requires_registered_connection_for_readiness() {
         assert!(!named_tunnel_ready_line(
             "INF Starting metrics server on 127.0.0.1:20241/metrics"
@@ -644,6 +760,44 @@ mod tests {
         assert!(named_tunnel_ready_line(
             "INF Registered tunnel connection connIndex=0 protocol=http2"
         ));
+    }
+
+    #[test]
+    fn timeout_diagnostic_identifies_edge_egress_and_proxy_scope() {
+        let proxy = ProxyConfig {
+            mode: "manual".into(),
+            url: "http://user:password-placeholder@127.0.0.1:7890".into(),
+        };
+        let proxy = configured_proxy_description(true, &proxy);
+        let message = readiness_timeout_message(
+            false,
+            28_766,
+            &proxy,
+            Some("ERR DialContext error: dial tcp 198.41.192.57:7844: i/o timeout"),
+            Path::new("cloudflared.log"),
+        );
+
+        assert!(message.contains("failure_boundary=cloudflared->Cloudflare Edge"));
+        assert!(message.contains("edge_transport=http2/TCP 7844"));
+        assert!(message.contains("configured_proxy=manual(http://127.0.0.1:7890)"));
+        assert!(message.contains("proxy_scope=HTTP(S) Origin only"));
+        assert!(message.contains("198.41.192.57:7844: i/o timeout"));
+        assert!(message.contains("该错误不表示本地端口 28766 不可用"));
+        assert!(!message.contains("password-placeholder"), "{message}");
+    }
+
+    #[test]
+    fn recent_error_survives_log_tail_starting_inside_utf8() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log_path = temp.path().join("cloudflared.log");
+        let content = format!(
+            "{}\n2026-08-19T08:43:16+08:00 ERR DialContext error: dial tcp 198.41.192.57:7844: i/o timeout\n",
+            "中".repeat(6_000)
+        );
+        std::fs::write(&log_path, content).expect("write cloudflared log");
+
+        let error = recent_cloudflared_error(&log_path).expect("recent edge error");
+        assert!(error.contains("198.41.192.57:7844: i/o timeout"));
     }
 
     #[tokio::test]
@@ -667,9 +821,10 @@ mod tests {
     #[tokio::test]
     async fn registered_connection_marks_named_tunnel_ready() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let log_path = temp.path().join("cloudflared.log");
         let ready = named_readiness(
-            "INF Registered tunnel connection connIndex=0 protocol=http2\n",
-            &temp.path().join("cloudflared.log"),
+            "2026-08-31T18:43:16Z INF Registered tunnel connection connIndex=0 protocol=http2\n",
+            &log_path,
         )
         .await
         .expect("named readiness");
@@ -678,6 +833,11 @@ mod tests {
         assert_eq!(
             ready.public_url.as_deref(),
             Some("https://fixed.example.invalid")
+        );
+        let log = std::fs::read_to_string(log_path).expect("read cloudflared log");
+        assert!(
+            log.contains("2026-09-01T02:43:16+08:00 INF Registered tunnel connection"),
+            "{log}"
         );
     }
 

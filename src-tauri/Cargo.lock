@@ -449,10 +449,11 @@ dependencies = [
 
 [[package]]
 name = "coding-tools-mcp-desktop"
-version = "0.1.34"
+version = "0.2.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "chrono",
  "dirs",
  "dotenvy",
  "flate2",

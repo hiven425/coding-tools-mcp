@@ -2,6 +2,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
@@ -27,11 +28,14 @@ pub struct CloudflareTunnelHandle {
 }
 
 pub fn resolve_cloudflared() -> AppResult<PathBuf> {
-    platform()
-        .cloudflared_candidates()
-        .into_iter()
-        .find(|path| path.is_file())
-        .or_else(|| cached_cloudflared_path().filter(|path| path.is_file()))
+    cached_cloudflared_path()
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            platform()
+                .cloudflared_candidates()
+                .into_iter()
+                .find(|path| path.is_file())
+        })
         .ok_or_else(|| {
             AppError::Message(
                 "未找到 cloudflared。请到「软件管理」安装，或自行安装 Cloudflare Tunnel CLI。\n\
@@ -104,12 +108,114 @@ fn cloudflared_release_asset() -> AppResult<&'static str> {
 /// Latest cloudflared release. Pinned for reproducibility; bump as needed.
 const CLOUDFLARED_VERSION: &str = "2026.8.2";
 
+fn cloudflared_release_sha256(asset: &str) -> AppResult<&'static str> {
+    match asset {
+        "cloudflared-windows-amd64.exe" => {
+            Ok("c29eee2b121f5436a642eed69fd9767da7e7b8c510fa50aaa130337f931357b5")
+        }
+        "cloudflared-linux-amd64" => {
+            Ok("fcfb02b575a52ca1af2e3267af4e1517bcdeb30ac48c834c69abaed3c0576ad2")
+        }
+        "cloudflared-linux-arm64" => {
+            Ok("7747d94570fb390cf47dcb4f9555c193c6355cda9793f0d878d9049e5d6a7790")
+        }
+        "cloudflared-darwin-amd64.tgz" => {
+            Ok("f1727723c586500e2092368ae21871b3df7ddfd2cb097f22d81bee4a9c458bb4")
+        }
+        "cloudflared-darwin-arm64.tgz" => {
+            Ok("9042c2c5d8b2de78e60f313d5fb31b6c5c1cebde787a3caf1f2c9588084ac442")
+        }
+        other => Err(AppError::Message(format!(
+            "cloudflared {CLOUDFLARED_VERSION} 没有受信任的 {other} 校验信息，已拒绝自动安装。"
+        ))),
+    }
+}
+
+fn verify_cloudflared_checksum(bytes: &[u8], expected_sha256: &str) -> AppResult<()> {
+    let actual_sha256 = format!("{:x}", Sha256::digest(bytes));
+    if actual_sha256 == expected_sha256 {
+        return Ok(());
+    }
+    Err(AppError::Message(format!(
+        "cloudflared 下载文件 SHA-256 校验失败，已保留现有版本：expected={expected_sha256} actual={actual_sha256}"
+    )))
+}
+
+fn cloudflared_version_is_current(output: &str) -> bool {
+    output.lines().any(|line| {
+        line.trim()
+            .strip_prefix("cloudflared version ")
+            .and_then(|rest| rest.split_whitespace().next())
+            == Some(CLOUDFLARED_VERSION)
+    })
+}
+
+fn cached_cloudflared_is_current(path: &Path) -> bool {
+    std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| cloudflared_version_is_current(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or(false)
+}
+
+async fn ensure_managed_cloudflared_current() -> AppResult<()> {
+    let Some(path) = cached_cloudflared_path().filter(|path| path.is_file()) else {
+        return Ok(());
+    };
+    if cached_cloudflared_is_current(&path) {
+        return Ok(());
+    }
+
+    download_cloudflared_to_cache().await?;
+    Ok(())
+}
+
+fn unique_sibling_path(dest: &Path, suffix: &str) -> PathBuf {
+    let file_name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cloudflared");
+    dest.with_file_name(format!(
+        ".{file_name}.{}.{suffix}",
+        uuid::Uuid::new_v4().simple()
+    ))
+}
+
+fn replace_cloudflared_file(staged: &Path, dest: &Path) -> AppResult<()> {
+    if !dest.is_file() {
+        std::fs::rename(staged, dest)?;
+        return Ok(());
+    }
+
+    let backup = unique_sibling_path(dest, "backup");
+    std::fs::rename(dest, &backup).map_err(|err| {
+        AppError::Message(format!("备份旧版 cloudflared 失败，未执行升级: {err}"))
+    })?;
+    if let Err(install_err) = std::fs::rename(staged, dest) {
+        return match std::fs::rename(&backup, dest) {
+            Ok(()) => Err(AppError::Message(format!(
+                "替换 cloudflared 失败，已恢复旧版本: {install_err}"
+            ))),
+            Err(restore_err) => Err(AppError::Message(format!(
+                "替换 cloudflared 失败，且恢复旧版本失败: {install_err}; restore={restore_err}; backup={}",
+                backup.display()
+            ))),
+        };
+    }
+
+    let _ = std::fs::remove_file(backup);
+    Ok(())
+}
+
 /// Download cloudflared into the app cache `bin/` directory, honoring the
 /// configured mirror + proxy. Windows/Linux assets are raw binaries; macOS
 /// assets are `.tgz` archives that need extraction.
 pub(crate) async fn download_cloudflared_to_cache() -> AppResult<PathBuf> {
     let settings = crate::settings::AppSettings::load_or_default();
     let asset = cloudflared_release_asset()?;
+    let expected_sha256 = cloudflared_release_sha256(asset)?;
     let url = format!(
         "https://github.com/cloudflare/cloudflared/releases/download/{CLOUDFLARED_VERSION}/{asset}"
     );
@@ -120,28 +226,48 @@ pub(crate) async fn download_cloudflared_to_cache() -> AppResult<PathBuf> {
     }
 
     let bytes = crate::tunnel::download::download_release_asset(&settings, &url, "cloudflared").await?;
+    verify_cloudflared_checksum(&bytes, expected_sha256)?;
+    let staged = unique_sibling_path(&dest, "download");
 
-    if asset.ends_with(".tgz") {
-        extract_cloudflared_from_tar_gz(&bytes, &dest)?;
+    let install_result = if asset.ends_with(".tgz") {
+        extract_cloudflared_from_tar_gz(&bytes, &staged)
     } else {
-        std::fs::write(&dest, &bytes)?;
+        std::fs::write(&staged, &bytes).map_err(AppError::from)
+    };
+    if let Err(err) = install_result {
+        let _ = std::fs::remove_file(&staged);
+        return Err(err);
     }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(&dest) {
+        if let Ok(meta) = std::fs::metadata(&staged) {
             let mut perms = meta.permissions();
             perms.set_mode(0o755);
-            let _ = std::fs::set_permissions(&dest, perms);
+            let _ = std::fs::set_permissions(&staged, perms);
         }
     }
 
-    if dest.is_file() {
-        Ok(dest)
-    } else {
-        Err(AppError::Message("cloudflared 自动安装失败。".into()))
+    if !cached_cloudflared_is_current(&staged) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(AppError::Message(format!(
+            "下载的 cloudflared 版本不是预期的 {CLOUDFLARED_VERSION}，已保留现有版本。"
+        )));
     }
+    // Concurrent tunnel starts may have completed the same upgrade while this
+    // download was in flight. Avoid replacing a now-current, possibly running binary.
+    if cached_cloudflared_is_current(&dest) {
+        let _ = std::fs::remove_file(&staged);
+        return Ok(dest);
+    }
+
+    let replace_result = replace_cloudflared_file(&staged, &dest);
+    if replace_result.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    replace_result?;
+    Ok(dest)
 }
 
 #[cfg(target_os = "macos")]
@@ -351,7 +477,6 @@ pub async fn spawn_cloudflare_tunnel(
     named_public_url: &str,
     use_proxy: bool,
 ) -> AppResult<CloudflareTunnelHandle> {
-    let cloudflared = resolve_cloudflared()?;
     let quick = cloudflare_mode != "named";
 
     if !quick {
@@ -366,6 +491,9 @@ pub async fn spawn_cloudflare_tunnel(
             ));
         }
     }
+
+    ensure_managed_cloudflared_current().await?;
+    let cloudflared = resolve_cloudflared()?;
 
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -689,9 +817,11 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        cloudflared_args, configured_proxy_description, extract_trycloudflare_url,
-        named_tunnel_ready_line, readiness_timeout_message, recent_cloudflared_error, stop_child,
-        stream_cloudflare_output, QuickTunnelReady,
+        cloudflared_args, cloudflared_release_asset, cloudflared_release_sha256,
+        cloudflared_version_is_current, configured_proxy_description, extract_trycloudflare_url,
+        named_tunnel_ready_line, readiness_timeout_message, recent_cloudflared_error,
+        replace_cloudflared_file, stop_child, stream_cloudflare_output,
+        verify_cloudflared_checksum, QuickTunnelReady,
     };
     use crate::error::AppResult;
     use crate::settings::ProxyConfig;
@@ -750,6 +880,88 @@ mod tests {
     #[test]
     fn managed_cloudflared_version_includes_connectivity_prechecks() {
         assert_eq!(super::CLOUDFLARED_VERSION, "2026.8.2");
+    }
+
+    #[test]
+    fn selected_cloudflared_release_has_a_pinned_sha256() {
+        let asset = cloudflared_release_asset().expect("supported release asset");
+        let sha256 = cloudflared_release_sha256(asset).expect("pinned release checksum");
+
+        assert_eq!(sha256.len(), 64);
+        assert!(sha256.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn cloudflared_download_checksum_rejects_modified_bytes() {
+        const ABC_SHA256: &str =
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+        verify_cloudflared_checksum(b"abc", ABC_SHA256).expect("matching checksum");
+        let error = verify_cloudflared_checksum(b"modified", ABC_SHA256)
+            .expect_err("modified bytes must be rejected");
+
+        assert!(error.to_string().contains("SHA-256 校验失败"), "{error}");
+    }
+
+    #[test]
+    fn managed_cloudflared_version_requires_exact_match() {
+        assert!(cloudflared_version_is_current(
+            "cloudflared version 2026.8.2 (built 2026-08-14T04:22 UTC)"
+        ));
+        assert!(!cloudflared_version_is_current(
+            "cloudflared version 2025.6.1 (built 2025-06-17T16:37 UTC)"
+        ));
+        assert!(!cloudflared_version_is_current(
+            "cloudflared development build"
+        ));
+    }
+
+    #[test]
+    fn staged_cloudflared_replaces_existing_binary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dest = temp.path().join("cloudflared");
+        let staged = temp.path().join("cloudflared.download");
+        std::fs::write(&dest, b"old-version").expect("write old binary");
+        std::fs::write(&staged, b"new-version").expect("write staged binary");
+
+        replace_cloudflared_file(&staged, &dest).expect("replace cloudflared");
+
+        assert_eq!(
+            std::fs::read(&dest).expect("read installed binary"),
+            b"new-version"
+        );
+        assert!(!staged.exists());
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("read tempdir")
+                .count(),
+            1,
+            "successful replacement must remove the backup"
+        );
+    }
+
+    #[test]
+    fn failed_cloudflared_replacement_restores_existing_binary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dest = temp.path().join("cloudflared");
+        let missing_staged = temp.path().join("missing.download");
+        std::fs::write(&dest, b"old-version").expect("write old binary");
+
+        let error = replace_cloudflared_file(&missing_staged, &dest)
+            .expect_err("missing staged binary must fail");
+
+        assert!(error.to_string().contains("已恢复旧版本"), "{error}");
+        assert_eq!(
+            std::fs::read(&dest).expect("read restored binary"),
+            b"old-version"
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("read tempdir")
+                .count(),
+            1,
+            "rollback must not leave a backup behind"
+        );
     }
 
     #[test]

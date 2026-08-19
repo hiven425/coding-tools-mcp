@@ -1,12 +1,13 @@
 {
   "name": "coding-tools-mcp-desktop",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Coding Tools MCP desktop client",
   "type": "module",
   "scripts": {
     "dev": "vite dev",
     "desktop": "tauri dev",
     "desktop:build": "tauri build",
+    "desktop:build:nsis": "tauri build --bundles nsis",
     "start": "tauri dev",
     "build": "vite build",
     "preview": "vite preview",
